@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Release"/>
+		<BuildType Name="MinSizeRel"/>
+		<BuildType Name="RelWithDebInfo"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="build/ToneForge.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="819c8560-c482-3daa-9219-82a7f23b9069" DefaultStartup="true">
+		<BuildDependency Project="build/ToneForgeData.vcxproj"/>
+		<BuildDependency Project="build/ToneForge_rc_lib.vcxproj"/>
+		<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="build/ToneForgeData.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a5e737a0-163a-3495-a828-ae47e0eee4ab">
+		<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="build/ToneForge_CopyIcon.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a8ad1614-5528-38f2-b188-92b2af098fea">
+		<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="build/ToneForge_rc_lib.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="7bbfd4f3-2fbf-3a81-bdd1-abc22065ef8c">
+		<BuildDependency Project="build/ToneForge_CopyIcon.vcxproj"/>
+		<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Folder Name="/CMakePredefinedTargets/">
+		<Project Path="build/ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="782d2509-ecd9-3c2f-b8af-25f37758173d">
+			<BuildDependency Project="build/ToneForge.vcxproj"/>
+			<BuildDependency Project="build/ToneForgeData.vcxproj"/>
+			<BuildDependency Project="build/ToneForge_rc_lib.vcxproj"/>
+			<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+		</Project>
+		<Project Path="build/INSTALL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="efa0c762-cb13-3c68-a88f-29aa142422d1">
+			<BuildDependency Project="build/ALL_BUILD.vcxproj"/>
+			<BuildDependency Project="build/ZERO_CHECK.vcxproj"/>
+			<Build Solution="Debug|*" Project="false"/>
+			<Build Solution="Release|*" Project="false"/>
+			<Build Solution="MinSizeRel|*" Project="false"/>
+			<Build Solution="RelWithDebInfo|*" Project="false"/>
+		</Project>
+		<Project Path="build/ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="b9c5f8ea-4410-380f-89b7-835200ff0c80"/>
+	</Folder>
+</Solution>
