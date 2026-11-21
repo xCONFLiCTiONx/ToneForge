@@ -123,4 +123,4 @@ After building, the executable is available in:
 ---
 
 ## License
-Project code is released under GPL-3.0-or-later. Steinberg ASIO SDK headers are covered by Steinberg's licensing terms.
+Project code is released under GPL-3.0. Steinberg ASIO SDK headers are covered by Steinberg's licensing terms.
