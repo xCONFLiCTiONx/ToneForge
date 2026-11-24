@@ -28,19 +28,19 @@ enum class AmpVoicing
 
 enum class DriveVoicing
 {
-    TubeScreamer = 0,         // Ibanez TS-9 (Mid-Hump Overdrive)
+    TubeScreamer = 0,         // Ibanez TS-9 (Mid-Hump Overdrive + Clean Bleed)
     KlonCentaur = 1,          // Klon Centaur (Transparent Germanium Clean Blend)
     RodentDistortion = 2,     // ProCo Rat 2 (Hard-Clipping Distortion)
-    HeavyMetalChainsaw = 3,   // Boss HM-2 (Swedish Death Metal Chainsaw)
-    PrecisionDrive = 4,       // Horizon Precision Drive (Modern Djent Attack)
-    BigMuffFuzz = 5,          // EHX Big Muff Pi (Wall of Fuzz)
+    HeavyMetalChainsaw = 3,   // Boss HM-2 (Swedish Death Metal Dual Mid-Peak Chainsaw)
+    PrecisionDrive = 4,       // Horizon Precision Drive (Modern Djent Tight Attack)
+    BigMuffFuzz = 5,          // EHX Big Muff Pi (Saturated Wall of Fuzz)
     CustomImported = 6        // User-Imported Pedal (.tfpedal, .xml, .wav, .nam)
 };
 
 enum class Vst3SlotPosition
 {
-    PreAmp = 0,  // Before Overdrive / Amp / NAM (ideal for gates, OD pedals, compressors, amp suites)
-    PostCab = 1  // After Cabinet / NAM, before Delay & Reverb (ideal for EQ, compressors, amp suites, FX)
+    PreAmp = 0,  // Before Overdrive / Amp / NAM (gates, OD pedals, compressors, amp suites)
+    PostCab = 1  // After Cabinet / NAM, before Delay & Reverb (EQ, compressors, amp suites, FX)
 };
 
 struct CustomPedalModel
@@ -108,7 +108,7 @@ public:
         reverbConvolution.prepare (spec);
         studioReverb.prepare (spec);
 
-        // Prepare 4x Oversampling Engine (2^2 = 4x) for overdrive & tube amp saturation
+        // Zero-latency polyphase IIR 4x oversampling (~2 samples group delay = <0.05 ms)
         oversampling = std::make_unique<juce::dsp::Oversampling<float>> (
             1, // mono processing before stereo spatial stage
             2, // 4x oversampling factor
@@ -121,8 +121,17 @@ public:
         // Force initial filter coefficient calculation
         lastToneRate = -1.0;
         lastCabRate = -1.0;
+        lastDriveRate = -1.0;
         updateToneStackFiltersIfNeeded();
         updateCabFiltersIfNeeded();
+        updateDriveShapingFiltersIfNeeded();
+
+        // Wet-return high-pass filters (~180 Hz) keep delay/reverb crystal clear without low-end mud
+        auto wetHpCoeff = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 180.0f, 0.707f);
+        delayHpL.coefficients = wetHpCoeff;
+        delayHpR.coefficients = wetHpCoeff;
+        reverbHpL.coefficients = wetHpCoeff;
+        reverbHpR.coefficients = wetHpCoeff;
 
         // Re-prepare NAM model for new sample rate / block size
         {
@@ -165,6 +174,58 @@ public:
             vst3PluginInstance->releaseResources();
     }
 
+    void updateDriveShapingFiltersIfNeeded()
+    {
+        const int modeInt = overdriveVoicing.load();
+        if (lastDriveRate == sampleRate && lastDriveMode == modeInt)
+            return;
+
+        lastDriveRate = sampleRate;
+        lastDriveMode = modeInt;
+
+        const auto mode = static_cast<DriveVoicing> (modeInt);
+        if (mode == DriveVoicing::TubeScreamer)
+        {
+            // Classic TS-9 720 Hz mid-hump boost before clipping
+            drivePrePeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 720.0f, 0.9f, juce::Decibels::decibelsToGain (6.5f));
+            drivePostPeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1000.0f, 0.7f, 1.0f);
+        }
+        else if (mode == DriveVoicing::HeavyMetalChainsaw)
+        {
+            // Legendary Boss HM-2 Swedish chainsaw dual mid-peaks (~950 Hz & ~1.25 kHz)
+            drivePrePeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 950.0f, 1.4f, juce::Decibels::decibelsToGain (9.0f));
+            drivePostPeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1300.0f, 1.6f, juce::Decibels::decibelsToGain (7.5f));
+        }
+        else if (mode == DriveVoicing::PrecisionDrive)
+        {
+            // Modern djent attack focus: tight upper-mid transient boost
+            drivePrePeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1400.0f, 0.9f, juce::Decibels::decibelsToGain (5.5f));
+            drivePostPeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+                sampleRate, 3200.0f, 0.707f, juce::Decibels::decibelsToGain (2.5f));
+        }
+        else if (mode == DriveVoicing::KlonCentaur)
+        {
+            // Transparent 1 kHz midrange push
+            drivePrePeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1000.0f, 0.8f, juce::Decibels::decibelsToGain (3.5f));
+            drivePostPeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1000.0f, 0.7f, 1.0f);
+        }
+        else
+        {
+            // Neutral flat shaping for Rat / Big Muff / Custom
+            drivePrePeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1000.0f, 0.7f, 1.0f);
+            drivePostPeakFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 1000.0f, 0.7f, 1.0f);
+        }
+    }
+
     void updateToneStackFiltersIfNeeded()
     {
         const float bVal = ampBass.load();
@@ -187,25 +248,25 @@ public:
         lastToneTreble = tVal;
         lastTonePresence = pVal;
 
-        // Bass: Low Shelf @ 90 Hz (-24 dB to +12 dB range)
-        float bassGainDb = (bVal - 0.5f) * 36.0f - 6.0f;
+        // Bass: Low Shelf @ 100 Hz (-20 dB to +12 dB)
+        float bassGainDb = (bVal - 0.5f) * 32.0f - 4.0f;
         bassFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
-            sampleRate, 90.0f, 0.707f, juce::Decibels::decibelsToGain (bassGainDb));
+            sampleRate, 100.0f, 0.707f, juce::Decibels::decibelsToGain (bassGainDb));
 
-        // Mid: Peak Filter @ 750 Hz (-15 dB to +15 dB)
-        float midGainDb = (mVal - 0.5f) * 30.0f;
+        // Mid: Peak Filter @ 700 Hz (-14 dB to +14 dB)
+        float midGainDb = (mVal - 0.5f) * 28.0f;
         midFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-            sampleRate, 750.0f, 0.85f, juce::Decibels::decibelsToGain (midGainDb));
+            sampleRate, 700.0f, 0.85f, juce::Decibels::decibelsToGain (midGainDb));
 
-        // Treble: High Shelf @ 2.8 kHz (-18 dB to +12 dB)
-        float trebGainDb = (tVal - 0.5f) * 30.0f - 3.0f;
+        // Treble: High Shelf @ 2.6 kHz (-16 dB to +12 dB)
+        float trebGainDb = (tVal - 0.5f) * 28.0f - 2.0f;
         trebleFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-            sampleRate, 2800.0f, 0.707f, juce::Decibels::decibelsToGain (trebGainDb));
+            sampleRate, 2600.0f, 0.707f, juce::Decibels::decibelsToGain (trebGainDb));
 
-        // Presence: High Shelf @ 5.5 kHz (-12 dB to +12 dB)
-        float presGainDb = (pVal - 0.5f) * 24.0f;
+        // Presence: Power-amp negative feedback High Shelf @ 4.8 kHz (-10 dB to +10 dB)
+        float presGainDb = (pVal - 0.5f) * 20.0f;
         presenceFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-            sampleRate, 5500.0f, 0.707f, juce::Decibels::decibelsToGain (presGainDb));
+            sampleRate, 4800.0f, 0.707f, juce::Decibels::decibelsToGain (presGainDb));
     }
 
     void updateCabFiltersIfNeeded()
@@ -217,24 +278,43 @@ public:
         lastCabRate = sampleRate;
         lastCabModel = modeInt;
 
+        // Zero-latency multi-pole speaker modeling: HP + cab thump + mid character + bite + steep 24 dB/oct LP
         const auto cabMode = static_cast<CabType> (modeInt);
         if (cabMode == CabType::Vintage30_4x12)
         {
-            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 85.0f, 0.707f);
-            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 4200.0f, 0.85f);
-            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 1200.0f, 1.2f, 0.65f);
+            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 80.0f, 0.707f);
+            cabResonanceFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 115.0f, 1.8f, juce::Decibels::decibelsToGain (4.5f));
+            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 620.0f, 1.3f, juce::Decibels::decibelsToGain (-4.0f));
+            cabBiteFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 2750.0f, 1.4f, juce::Decibels::decibelsToGain (4.0f));
+            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 4600.0f, 0.85f);
+            cabLpFilter2.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 5400.0f, 0.707f);
         }
         else if (cabMode == CabType::Greenback_2x12)
         {
-            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 95.0f, 0.707f);
-            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 3800.0f, 0.75f);
-            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 450.0f, 1.0f, 1.25f);
+            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 92.0f, 0.707f);
+            cabResonanceFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 125.0f, 1.6f, juce::Decibels::decibelsToGain (3.5f));
+            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 480.0f, 1.1f, juce::Decibels::decibelsToGain (2.5f));
+            cabBiteFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 2200.0f, 1.2f, juce::Decibels::decibelsToGain (2.0f));
+            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 4100.0f, 0.75f);
+            cabLpFilter2.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 4800.0f, 0.707f);
         }
-        else // American 1x12 (also fallback if CustomIR selected with no file loaded)
+        else // American 1x12 Open-Back
         {
-            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 75.0f, 0.707f);
-            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 5200.0f, 0.707f);
-            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 600.0f, 0.9f, 0.70f);
+            cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 72.0f, 0.707f);
+            cabResonanceFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 105.0f, 1.5f, juce::Decibels::decibelsToGain (2.5f));
+            cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 580.0f, 1.0f, juce::Decibels::decibelsToGain (-3.5f));
+            cabBiteFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                sampleRate, 3400.0f, 1.2f, juce::Decibels::decibelsToGain (3.0f));
+            cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 5400.0f, 0.707f);
+            cabLpFilter2.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 6200.0f, 0.707f);
         }
     }
 
@@ -248,7 +328,6 @@ public:
         if (numSamples <= 0)
             return;
 
-        // Guard against unexpected oversized buffers
         if (static_cast<size_t> (numSamples) > tempInput.size())
         {
             tempInput.resize (static_cast<size_t> (numSamples), 0.0f);
@@ -335,7 +414,6 @@ public:
         float rmsIn = std::sqrt (sumSquaresIn / static_cast<float> (numSamples));
         inputRms.store (rmsIn);
 
-        // If tuner mute or master mute active, output silence
         if (isMuted || tunerMute.load())
         {
             for (int ch = 0; ch < numOutputs; ++ch)
@@ -347,7 +425,8 @@ public:
 
         // Snapshot DSP Parameters
         const bool gateOn = gateEnabled.load();
-        const float gateThresh = juce::Decibels::decibelsToGain (gateThresholdDb.load());
+        const float gateOpenThresh = juce::Decibels::decibelsToGain (gateThresholdDb.load());
+        const float gateCloseThresh = gateOpenThresh * 0.707f; // 3 dB hysteresis prevents chattering
         const float gateRelease = gateReleaseMs.load();
 
         const bool compOn = compressorEnabled.load();
@@ -384,7 +463,8 @@ public:
 
         const float outGain = juce::Decibels::decibelsToGain (outputDb.load());
 
-        // Update EQ & Cab filters ONLY when parameters actually changed (no per-block heap alloc)
+        // Update filters ONLY when parameters change (zero per-block heap allocations)
+        updateDriveShapingFiltersIfNeeded();
         updateToneStackFiltersIfNeeded();
         updateCabFiltersIfNeeded();
 
@@ -392,25 +472,41 @@ public:
             static_cast<size_t> (juce::jmax (1.0, sampleRate * delTime)));
 
         bool isGatingNow = false;
+        const float gateAttCoeff = 1.0f - std::exp (-1.0f / static_cast<float> (sampleRate * 0.0015)); // 1.5 ms fast open
+        const float gateRelCoeff = 1.0f - std::exp (-1.0f / static_cast<float> (sampleRate * juce::jmax (0.005f, gateRelease * 0.001f)));
 
-        // --- STAGE 1: GATE + COMPRESSOR ---
+        // --- STAGE 1: HYSTERESIS NOISE GATE + STUDIO COMPRESSOR ---
         for (int i = 0; i < numSamples; ++i)
         {
             float x = tempInput[static_cast<size_t> (i)];
 
-            // 1. NOISE GATE
+            // 1. NOISE GATE (with 3 dB hysteresis & smooth gain envelope)
             if (gateOn)
             {
                 float absVal = std::abs (x);
-                float relCoeff = static_cast<float> (1.0 / (sampleRate * (gateRelease * 0.001) + 1.0));
-                gateEnv += (absVal > gateEnv ? 0.3f : relCoeff) * (absVal - gateEnv);
-                if (gateEnv < gateThresh)
+                gateEnv += (absVal > gateEnv ? 0.35f : gateRelCoeff) * (absVal - gateEnv);
+
+                if (gateOpenState)
                 {
-                    isGatingNow = true;
-                    float ratio = gateEnv / (gateThresh + 0.00001f);
-                    float gateGain = ratio * ratio;
-                    x *= gateGain;
+                    if (gateEnv < gateCloseThresh)
+                        gateOpenState = false;
                 }
+                else
+                {
+                    if (gateEnv > gateOpenThresh)
+                        gateOpenState = true;
+                }
+
+                float targetGain = gateOpenState ? 1.0f : 0.0f;
+                gateGainSmooth += (targetGain > gateGainSmooth ? gateAttCoeff : gateRelCoeff) * (targetGain - gateGainSmooth);
+                if (gateGainSmooth < 0.95f)
+                    isGatingNow = true;
+                x *= gateGainSmooth;
+            }
+            else
+            {
+                gateOpenState = true;
+                gateGainSmooth = 1.0f;
             }
 
             // 2. COMPRESSOR
@@ -418,14 +514,14 @@ public:
             {
                 float absVal = std::abs (x);
                 float attackCoeff = static_cast<float> (1.0 / (sampleRate * (compAttack * 0.001) + 1.0));
-                compEnv += (absVal > compEnv ? attackCoeff : 0.002f) * (absVal - compEnv);
+                compEnv += (absVal > compEnv ? attackCoeff : 0.0015f) * (absVal - compEnv);
                 const float compThresh = 0.12f;
                 if (compEnv > compThresh)
                 {
                     float compressed = compThresh + (compEnv - compThresh) / (1.0f + compAmount * 5.0f);
                     x *= compressed / juce::jmax (compEnv, 0.0001f);
                 }
-                x *= (1.0f + compAmount * 1.6f);
+                x *= (1.0f + compAmount * 1.4f);
             }
 
             tempLeft[static_cast<size_t> (i)] = x;
@@ -440,33 +536,45 @@ public:
             processVst3Slot (numSamples);
         }
 
-        // --- STAGE 2: PRE-GAIN HIGH-PASS TIGHTENER + OVERDRIVE + TUBE AMP SATURATION (4x OVERSAMPLED) ---
+        // --- PRE-OVERDRIVE HARDWARE EQ SHAPING (e.g. TS-9 720 Hz hump, HM-2 chainsaw peak) ---
+        if (odOn)
+        {
+            for (int i = 0; i < numSamples; ++i)
+                tempLeft[static_cast<size_t> (i)] = drivePrePeakFilter.processSample (tempLeft[static_cast<size_t> (i)]);
+        }
+
+        // --- STAGE 2: 4x OVERSAMPLED OVERDRIVE + CASCADED TUBE PREAMP ---
         if (odOn || ampOn)
         {
-            float preCutFreq = 120.0f;
-            if (ampModel == AmpVoicing::Crunch) preCutFreq = 250.0f;
-            else if (ampModel == AmpVoicing::Lead) preCutFreq = 380.0f;
+            float preCutFreq = 100.0f;
+            if (ampModel == AmpVoicing::Crunch) preCutFreq = 180.0f;
+            else if (ampModel == AmpVoicing::Lead) preCutFreq = 260.0f;
 
             if (odOn)
             {
-                if (odMode == DriveVoicing::TubeScreamer) preCutFreq = 650.0f;
-                else if (odMode == DriveVoicing::PrecisionDrive) preCutFreq = 750.0f;
-                else if (odMode == DriveVoicing::HeavyMetalChainsaw) preCutFreq = 450.0f;
-                else if (odMode == DriveVoicing::RodentDistortion) preCutFreq = 350.0f;
+                if (odMode == DriveVoicing::TubeScreamer) preCutFreq = 620.0f;
+                else if (odMode == DriveVoicing::PrecisionDrive) preCutFreq = 740.0f;
+                else if (odMode == DriveVoicing::HeavyMetalChainsaw) preCutFreq = 420.0f;
+                else if (odMode == DriveVoicing::RodentDistortion) preCutFreq = 320.0f;
                 else if (odMode == DriveVoicing::CustomImported && customPedal.isLoaded) preCutFreq = customPedal.preFilterFreq;
             }
 
             auto processNonLinearSamples = [&] (float* data, int count, double procRate)
             {
                 const float preCutCoeff = std::exp (-2.0f * 3.14159265f * preCutFreq / static_cast<float> (procRate));
+                // Rate-compensated 12AX7 inter-stage Miller capacitance LP (~5.2 kHz) and coupling cap HP (~115 Hz)
+                const float millerAlpha = 1.0f - std::exp (-2.0f * 3.14159265f * 5200.0f / static_cast<float> (procRate));
+                const float couplingCoeff = std::exp (-2.0f * 3.14159265f * 115.0f / static_cast<float> (procRate));
+                const float toneFreq = 850.0f + odTone * 5400.0f;
+                const float toneAlpha = 1.0f - std::exp (-2.0f * 3.14159265f * toneFreq / static_cast<float> (procRate));
 
                 for (int i = 0; i < count; ++i)
                 {
                     float x = data[i];
 
-                    // Pre-gain bass cut (High-Pass Filter)
+                    // Pre-gain bass tightener
                     preHpState = preHpState * preCutCoeff + x * (1.0f - preCutCoeff);
-                    float tightInput = x - preHpState * 0.92f;
+                    float tightInput = x - preHpState * 0.90f;
 
                     // 3. OVERDRIVE PEDAL
                     if (odOn)
@@ -478,29 +586,32 @@ public:
 
                         if (odMode == DriveVoicing::TubeScreamer)
                         {
-                            driven = pedalIn * (1.0f + odDrive * 12.0f);
+                            driven = pedalIn * (1.0f + odDrive * 14.0f);
+                            // Soft symmetrical diode clipping + authentic TS op-amp clean bleed
                             clipped = std::tanh (driven);
+                            cleanBlend = 0.14f;
                         }
                         else if (odMode == DriveVoicing::KlonCentaur)
                         {
                             driven = pedalIn * (1.0f + odDrive * 14.0f);
                             clipped = driven > 0.0f ? std::tanh (driven * 1.25f) * 0.82f : std::tanh (driven * 0.92f);
-                            cleanBlend = juce::jlimit (0.0f, 0.40f, (1.0f - odDrive) * 0.50f);
+                            cleanBlend = juce::jlimit (0.0f, 0.42f, (1.0f - odDrive) * 0.50f);
                         }
                         else if (odMode == DriveVoicing::RodentDistortion)
                         {
                             driven = pedalIn * (1.0f + odDrive * 32.0f);
-                            clipped = juce::jlimit (-0.78f, 0.78f, driven);
+                            clipped = std::tanh (juce::jlimit (-1.15f, 1.15f, driven) * 1.1f);
                         }
                         else if (odMode == DriveVoicing::HeavyMetalChainsaw)
                         {
-                            driven = pedalIn * (1.0f + odDrive * 40.0f);
-                            clipped = juce::jlimit (-0.75f, 0.75f, std::tanh (driven * 1.6f));
+                            driven = pedalIn * (1.0f + odDrive * 42.0f);
+                            clipped = juce::jlimit (-0.78f, 0.78f, std::tanh (driven * 1.6f));
                         }
                         else if (odMode == DriveVoicing::PrecisionDrive)
                         {
-                            driven = pedalIn * (1.0f + odDrive * 28.0f);
-                            clipped = std::tanh (driven * 1.5f);
+                            driven = pedalIn * (1.0f + odDrive * 26.0f);
+                            clipped = std::tanh (driven * 1.45f);
+                            cleanBlend = 0.10f;
                         }
                         else if (odMode == DriveVoicing::BigMuffFuzz)
                         {
@@ -524,45 +635,50 @@ public:
                             cleanBlend = customPedal.cleanBlend;
                         }
 
-                        // Tone shaping post-filter (rate-compensated)
-                        float toneFreq = 800.0f + odTone * 5500.0f;
-                        float toneCoeff = 1.0f - std::exp (-2.0f * 3.14159265f * toneFreq / static_cast<float> (procRate));
-                        odPostFilterState = odPostFilterState + toneCoeff * (clipped - odPostFilterState);
-
-                        float wetSignal = odPostFilterState * (0.75f + odLevel * 0.65f);
+                        odPostFilterState += toneAlpha * (clipped - odPostFilterState);
+                        float wetSignal = odPostFilterState * (0.75f + odLevel * 0.70f);
                         tightInput = (pedalIn * cleanBlend) + (wetSignal * (1.0f - cleanBlend));
                     }
 
-                    // 4. TUBE AMP HEAD STAGE
+                    // 4. CASCADED 12AX7 TUBE PREAMP STAGE (with proper inter-stage RC filtering & DC blocking)
                     if (ampOn)
                     {
                         float ampIn = tightInput;
 
                         if (ampModel == AmpVoicing::Clean)
                         {
-                            float drive1 = 1.0f + aGain * 6.0f;
-                            float tube1 = triodeStage (ampIn, drive1, 0.08f);
-                            x = tube1 * (aMaster * 1.4f);
+                            float drive1 = 1.0f + aGain * 5.5f;
+                            float tube1 = triodeStage (ampIn, drive1, 0.06f);
+                            ampDcState1 = ampDcState1 * couplingCoeff + tube1 * (1.0f - couplingCoeff);
+                            x = (tube1 - ampDcState1) * (0.85f + aMaster * 0.75f);
                         }
                         else if (ampModel == AmpVoicing::Crunch)
                         {
                             float drive1 = 1.0f + aGain * 14.0f;
-                            float t1 = triodeStage (ampIn, drive1, 0.12f);
-                            ampStage1State = ampStage1State * 0.60f + t1 * 0.40f;
-                            float t2 = triodeStage (ampStage1State, 2.2f, 0.05f);
-                            x = t2 * (aMaster * 1.3f);
+                            float t1 = triodeStage (ampIn, drive1, 0.11f);
+                            ampDcState1 = ampDcState1 * couplingCoeff + t1 * (1.0f - couplingCoeff);
+                            t1 -= ampDcState1;
+                            ampStage1State += millerAlpha * (t1 - ampStage1State);
+
+                            float t2 = triodeStage (ampStage1State, 2.4f, 0.05f);
+                            ampDcState2 = ampDcState2 * couplingCoeff + t2 * (1.0f - couplingCoeff);
+                            x = (t2 - ampDcState2) * (0.80f + aMaster * 0.70f);
                         }
-                        else // Lead High Gain 5150 / Rectifier
+                        else // Lead High Gain (5150 / Dual Rectifier 3-stage cascaded preamp)
                         {
-                            float drive1 = 1.0f + aGain * 32.0f;
-                            float t1 = triodeStage (ampIn, drive1 * 0.5f, 0.15f);
-                            ampStage1State = ampStage1State * 0.50f + t1 * 0.50f;
+                            float drive1 = 1.0f + aGain * 28.0f;
+                            float t1 = triodeStage (ampIn, drive1 * 0.55f, 0.14f);
+                            ampDcState1 = ampDcState1 * couplingCoeff + t1 * (1.0f - couplingCoeff);
+                            t1 -= ampDcState1;
+                            ampStage1State += millerAlpha * (t1 - ampStage1State);
 
-                            float t2 = triodeStage (ampStage1State, 3.2f, 0.08f);
-                            ampStage2State = ampStage2State * 0.55f + t2 * 0.45f;
+                            float t2 = triodeStage (ampStage1State, 3.0f, 0.08f);
+                            ampDcState2 = ampDcState2 * couplingCoeff + t2 * (1.0f - couplingCoeff);
+                            t2 -= ampDcState2;
+                            ampStage2State += millerAlpha * (t2 - ampStage2State);
 
-                            float t3 = triodeStage (ampStage2State, 2.4f, 0.02f);
-                            x = t3 * (aMaster * 1.25f);
+                            float t3 = triodeStage (ampStage2State, 2.3f, 0.03f);
+                            x = t3 * (0.78f + aMaster * 0.65f);
                         }
                     }
                     else
@@ -590,9 +706,17 @@ public:
             }
         }
 
-        // --- STAGE 3: 3-BAND EQ + PRESENCE TONE STACK ---
+        // Post-overdrive shaping (e.g. HM-2 second peak, Precision Drive sheen)
+        if (odOn)
+        {
+            for (int i = 0; i < numSamples; ++i)
+                tempLeft[static_cast<size_t> (i)] = drivePostPeakFilter.processSample (tempLeft[static_cast<size_t> (i)]);
+        }
+
+        // --- STAGE 3: 3-BAND TONE STACK + POWER AMP TUBE SATURATION ---
         if (ampOn)
         {
+            const float powerDrive = 1.0f + aMaster * 0.9f;
             for (int i = 0; i < numSamples; ++i)
             {
                 float x = tempLeft[static_cast<size_t> (i)];
@@ -600,6 +724,8 @@ public:
                 x = midFilter.processSample (x);
                 x = trebleFilter.processSample (x);
                 x = presenceFilter.processSample (x);
+                // Symmetrical push-pull 6L6/EL34 power-amp warmth
+                x = std::tanh (x * powerDrive) / std::tanh (powerDrive);
                 tempLeft[static_cast<size_t> (i)] = x;
             }
         }
@@ -611,8 +737,8 @@ public:
             const juce::ScopedTryLock tryLock (namLock);
             if (tryLock.isLocked() && namModel != nullptr)
             {
-                float namInGain = juce::Decibels::decibelsToGain (namInputGainDb.load());
-                float namOutGain = juce::Decibels::decibelsToGain (namOutputGainDb.load());
+                const float namInGain = juce::Decibels::decibelsToGain (namInputGainDb.load());
+                const float namOutGain = juce::Decibels::decibelsToGain (namOutputGainDb.load()) * namAutoLoudnessGain;
 
                 for (int i = 0; i < numSamples; ++i)
                     tempLeft[static_cast<size_t> (i)] *= namInGain;
@@ -651,8 +777,11 @@ public:
                 {
                     float x = tempLeft[static_cast<size_t> (i)];
                     x = cabHpFilter.processSample (x);
-                    x = cabLpFilter.processSample (x);
+                    x = cabResonanceFilter.processSample (x);
                     x = cabNotchFilter.processSample (x);
+                    x = cabBiteFilter.processSample (x);
+                    x = cabLpFilter.processSample (x);
+                    x = cabLpFilter2.processSample (x);
                     tempLeft[static_cast<size_t> (i)] = x;
                     tempRight[static_cast<size_t> (i)] = x;
                 }
@@ -669,7 +798,7 @@ public:
             processVst3Slot (numSamples);
         }
 
-        // --- STAGE 7A: STEREO PING-PONG TAPE DELAY ---
+        // --- STAGE 7A: STEREO PING-PONG TAPE DELAY (with HP wet clarity filter) ---
         if (delOn && delMix > 0.001f && ! delayBufferL.empty())
         {
             const float damp = 0.30f + delTone * 0.60f;
@@ -682,8 +811,8 @@ public:
                 const size_t offsetR = juce::jmax<size_t> (1, static_cast<size_t> (delaySamples * 0.85f));
                 const size_t readR = (delayWrite + delayBufferR.size() - offsetR) % delayBufferR.size();
 
-                float delayedL = delayBufferL[readL];
-                float delayedR = delayBufferR[readR];
+                float delayedL = delayHpL.processSample (delayBufferL[readL]);
+                float delayedR = delayHpR.processSample (delayBufferR[readR]);
 
                 delayDampL = delayDampL * (1.0f - damp) + delayedL * damp;
                 delayDampR = delayDampR * (1.0f - damp) + delayedR * damp;
@@ -691,8 +820,8 @@ public:
                 delayBufferL[delayWrite] = l + delayDampR * delFeedback;
                 delayBufferR[delayWrite] = r + delayDampL * delFeedback;
 
-                tempLeft[static_cast<size_t> (i)] = l * (1.0f - delMix * 0.65f) + delayDampL * delMix;
-                tempRight[static_cast<size_t> (i)] = r * (1.0f - delMix * 0.65f) + delayDampR * delMix;
+                tempLeft[static_cast<size_t> (i)] = l * (1.0f - delMix * 0.50f) + delayDampL * delMix;
+                tempRight[static_cast<size_t> (i)] = r * (1.0f - delMix * 0.50f) + delayDampR * delMix;
 
                 delayWrite = (delayWrite + 1) % delayBufferL.size();
             }
@@ -703,8 +832,11 @@ public:
         {
             if (hasCustomReverbLoaded.load())
             {
-                juce::FloatVectorOperations::copy (reverbWetL.data(), tempLeft.data(), numSamples);
-                juce::FloatVectorOperations::copy (reverbWetR.data(), tempRight.data(), numSamples);
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    reverbWetL[static_cast<size_t> (i)] = reverbHpL.processSample (tempLeft[static_cast<size_t> (i)]);
+                    reverbWetR[static_cast<size_t> (i)] = reverbHpR.processSample (tempRight[static_cast<size_t> (i)]);
+                }
                 reverbPointers[0] = reverbWetL.data();
                 reverbPointers[1] = reverbWetR.data();
                 juce::dsp::AudioBlock<float> wetBlock (reverbPointers, 2, static_cast<size_t> (numSamples));
@@ -720,20 +852,34 @@ public:
             }
             else
             {
+                // Run wet reverb on HP-filtered send so palm mutes stay punchy and dry
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    reverbWetL[static_cast<size_t> (i)] = reverbHpL.processSample (tempLeft[static_cast<size_t> (i)]);
+                    reverbWetR[static_cast<size_t> (i)] = reverbHpR.processSample (tempRight[static_cast<size_t> (i)]);
+                }
+
                 juce::dsp::Reverb::Parameters revParams;
                 revParams.roomSize = 0.15f + revDecay * 0.80f;
                 revParams.damping = revDamp;
-                revParams.wetLevel = revMix;
-                revParams.dryLevel = 1.0f - revMix * 0.35f;
+                revParams.wetLevel = 1.0f;
+                revParams.dryLevel = 0.0f;
                 revParams.width = 1.0f;
                 revParams.freezeMode = 0.0f;
                 studioReverb.setParameters (revParams);
 
-                tempPointers[0] = tempLeft.data();
-                tempPointers[1] = tempRight.data();
-                juce::dsp::AudioBlock<float> revBlock (tempPointers, 2, static_cast<size_t> (numSamples));
+                reverbPointers[0] = reverbWetL.data();
+                reverbPointers[1] = reverbWetR.data();
+                juce::dsp::AudioBlock<float> revBlock (reverbPointers, 2, static_cast<size_t> (numSamples));
                 juce::dsp::ProcessContextReplacing<float> revCtx (revBlock);
                 studioReverb.process (revCtx);
+
+                const float dryAmt = 1.0f - revMix * 0.35f;
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    tempLeft[static_cast<size_t> (i)] = tempLeft[static_cast<size_t> (i)] * dryAmt + reverbWetL[static_cast<size_t> (i)] * revMix;
+                    tempRight[static_cast<size_t> (i)] = tempRight[static_cast<size_t> (i)] * dryAmt + reverbWetR[static_cast<size_t> (i)] * revMix;
+                }
             }
         }
 
@@ -785,9 +931,19 @@ public:
             // Prepare & prewarm model for current sample rate and block size outside audio thread
             newModel->Reset (sampleRate, maxBlockSize);
 
+            // Standard NAM loudness normalization (target -18 dB LUFS, matching official NAM plugin)
+            float autoGain = 1.0f;
+            if (newModel->HasLoudness())
+            {
+                constexpr double targetLoudnessDb = -18.0;
+                double deltaDb = juce::jlimit (-18.0, 18.0, targetLoudnessDb - newModel->GetLoudness());
+                autoGain = juce::Decibels::decibelsToGain (static_cast<float> (deltaDb));
+            }
+
             {
                 const juce::ScopedLock sl (namLock);
                 namModel = std::move (newModel);
+                namAutoLoudnessGain = autoGain;
 
                 namModelName = file.getFileNameWithoutExtension();
                 double rate = namModel->GetExpectedSampleRate();
@@ -817,6 +973,7 @@ public:
     {
         const juce::ScopedLock sl (namLock);
         namModel.reset();
+        namAutoLoudnessGain = 1.0f;
         namModelName = "No NAM Model Loaded";
         namModelPath = "";
         hasNamLoaded.store (false);
@@ -829,7 +986,6 @@ public:
 
     static juce::File resolveVst3BundlePath (const juce::File& input)
     {
-        // If user selected the inner .vst3 DLL inside *.vst3/Contents/x86_64-win/, walk up to the .vst3 bundle root
         auto cur = input;
         for (int depth = 0; depth < 4 && cur.exists(); ++depth)
         {
@@ -877,7 +1033,6 @@ public:
             return false;
         }
 
-        // Configure stereo bus layout cleanly (required by many modern VST3s like TONE3000, Gateway, Focusrite Red)
         newInstance->enableAllBuses();
         juce::AudioProcessor::BusesLayout stereoLayout;
         stereoLayout.inputBuses.add (juce::AudioChannelSet::stereo());
@@ -888,7 +1043,6 @@ public:
         }
         else
         {
-            // Fallback: mono-in / stereo-out (common for guitar amp sims)
             juce::AudioProcessor::BusesLayout monoInStereoOut;
             monoInStereoOut.inputBuses.add (juce::AudioChannelSet::mono());
             monoInStereoOut.outputBuses.add (juce::AudioChannelSet::stereo());
@@ -1103,21 +1257,34 @@ public:
     void resetDsp()
     {
         gateEnv = 0.0f;
+        gateGainSmooth = 1.0f;
+        gateOpenState = true;
         compEnv = 0.0f;
         odPostFilterState = 0.0f;
         ampStage1State = 0.0f;
         ampStage2State = 0.0f;
+        ampDcState1 = 0.0f;
+        ampDcState2 = 0.0f;
         preHpState = 0.0f;
         delayDampL = 0.0f;
         delayDampR = 0.0f;
 
+        drivePrePeakFilter.reset();
+        drivePostPeakFilter.reset();
         bassFilter.reset();
         midFilter.reset();
         trebleFilter.reset();
         presenceFilter.reset();
         cabHpFilter.reset();
-        cabLpFilter.reset();
+        cabResonanceFilter.reset();
         cabNotchFilter.reset();
+        cabBiteFilter.reset();
+        cabLpFilter.reset();
+        cabLpFilter2.reset();
+        delayHpL.reset();
+        delayHpR.reset();
+        reverbHpL.reset();
+        reverbHpR.reset();
         studioReverb.reset();
     }
 
@@ -1279,6 +1446,12 @@ private:
 
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
 
+    // Overdrive pre/post EQ shaping
+    juce::dsp::IIR::Filter<float> drivePrePeakFilter;
+    juce::dsp::IIR::Filter<float> drivePostPeakFilter;
+    double lastDriveRate = -1.0;
+    int lastDriveMode = -1;
+
     // 3-Band EQ + Presence
     juce::dsp::IIR::Filter<float> bassFilter;
     juce::dsp::IIR::Filter<float> midFilter;
@@ -1290,15 +1463,25 @@ private:
     float lastToneTreble = -1.0f;
     float lastTonePresence = -1.0f;
 
-    // Cabinet Filters
+    // Multi-pole Speaker Cabinet Filters
     juce::dsp::IIR::Filter<float> cabHpFilter;
-    juce::dsp::IIR::Filter<float> cabLpFilter;
+    juce::dsp::IIR::Filter<float> cabResonanceFilter;
     juce::dsp::IIR::Filter<float> cabNotchFilter;
+    juce::dsp::IIR::Filter<float> cabBiteFilter;
+    juce::dsp::IIR::Filter<float> cabLpFilter;
+    juce::dsp::IIR::Filter<float> cabLpFilter2;
     double lastCabRate = -1.0;
     int lastCabModel = -1;
 
+    // Wet-return clarity HP filters for Delay & Reverb
+    juce::dsp::IIR::Filter<float> delayHpL;
+    juce::dsp::IIR::Filter<float> delayHpR;
+    juce::dsp::IIR::Filter<float> reverbHpL;
+    juce::dsp::IIR::Filter<float> reverbHpR;
+
     // NAM Engine
     std::unique_ptr<nam::DSP> namModel;
+    float namAutoLoudnessGain = 1.0f;
     juce::CriticalSection namLock;
 
     // VST3 Hosting
@@ -1309,10 +1492,14 @@ private:
     juce::MidiBuffer vst3MidiBuffer;
 
     float gateEnv = 0.0f;
+    float gateGainSmooth = 1.0f;
+    bool gateOpenState = true;
     float compEnv = 0.0f;
     float odPostFilterState = 0.0f;
     float ampStage1State = 0.0f;
     float ampStage2State = 0.0f;
+    float ampDcState1 = 0.0f;
+    float ampDcState2 = 0.0f;
     float preHpState = 0.0f;
     float delayDampL = 0.0f;
     float delayDampR = 0.0f;
