@@ -51,14 +51,16 @@ struct TonePreset
     juce::String customReverbPath;
     // External VST3 Plugin
     bool vst3On = false;
+    int vst3Position = 1; // 0 = Pre-Amp, 1 = Post-Cab
     juce::String vst3PluginPath;
+    juce::String vst3StateBase64;
     // Neural Amp Modeler
     bool namOn = false;
     juce::String namModelPath;
     float namInputGainDb = 0.0f;
     float namOutputGainDb = 0.0f;
     // Output
-    float outputDb = -50.0f;
+    float outputDb = -6.0f;
 
     juce::XmlElement toXml() const
     {
@@ -107,7 +109,10 @@ struct TonePreset
         xml.setAttribute ("customReverbPath", customReverbPath);
 
         xml.setAttribute ("vst3On", vst3On);
+        xml.setAttribute ("vst3Position", vst3Position);
         xml.setAttribute ("vst3PluginPath", vst3PluginPath);
+        if (vst3StateBase64.isNotEmpty())
+            xml.setAttribute ("vst3StateBase64", vst3StateBase64);
 
         xml.setAttribute ("namOn", namOn);
         xml.setAttribute ("namModelPath", namModelPath);
@@ -166,14 +171,16 @@ struct TonePreset
         p.customReverbPath = xml.getStringAttribute ("customReverbPath");
 
         p.vst3On = xml.getBoolAttribute ("vst3On", false);
+        p.vst3Position = xml.getIntAttribute ("vst3Position", 1);
         p.vst3PluginPath = xml.getStringAttribute ("vst3PluginPath");
+        p.vst3StateBase64 = xml.getStringAttribute ("vst3StateBase64");
 
         p.namOn = xml.getBoolAttribute ("namOn", false);
         p.namModelPath = xml.getStringAttribute ("namModelPath");
         p.namInputGainDb = static_cast<float> (xml.getDoubleAttribute ("namInputGainDb", 0.0));
         p.namOutputGainDb = static_cast<float> (xml.getDoubleAttribute ("namOutputGainDb", 0.0));
 
-        p.outputDb = static_cast<float> (xml.getDoubleAttribute ("outputDb", -50.0));
+        p.outputDb = static_cast<float> (xml.getDoubleAttribute ("outputDb", -6.0));
         return p;
     }
 };
@@ -181,73 +188,72 @@ struct TonePreset
 class PresetManager
 {
 public:
-    static juce::File getUserPresetsFolder()
+    static juce::File getAppDataSubfolder (const juce::String& subfolder)
     {
         auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
                         .getChildFile ("ToneForge")
-                        .getChildFile ("Presets");
+                        .getChildFile (subfolder);
         if (! dir.exists())
             dir.createDirectory();
         return dir;
     }
 
+    static juce::File getUserPresetsFolder() { return getAppDataSubfolder ("Presets"); }
+    static juce::File getModelsFolder()      { return getAppDataSubfolder ("Models"); }
+    static juce::File getIrsFolder()         { return getAppDataSubfolder ("IRs"); }
+    static juce::File getPedalsFolder()      { return getAppDataSubfolder ("Pedals"); }
+
+    static juce::File findProjectResourcesDir()
+    {
+        auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory();
+        const juce::File candidates[] = {
+            exeDir.getChildFile ("Resources"),
+            exeDir.getParentDirectory().getChildFile ("Resources"),
+            exeDir.getParentDirectory().getParentDirectory().getChildFile ("Resources"),
+            juce::File ("E:/ToneForge/Resources")
+        };
+
+        for (const auto& dir : candidates)
+            if (dir.isDirectory())
+                return dir;
+
+        return {};
+    }
+
     static void deployFactoryResources()
     {
-        auto modelsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Models");
-        if (! modelsDir.exists())
-            modelsDir.createDirectory();
+        auto modelsDir = getModelsFolder();
+        auto irsDir = getIrsFolder();
+        auto pedalsDir = getPedalsFolder();
 
-        auto irsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                            .getChildFile ("ToneForge")
-                            .getChildFile ("IRs");
-        if (! irsDir.exists())
-            irsDir.createDirectory();
+        auto projectResourcesDir = findProjectResourcesDir();
+        if (! projectResourcesDir.isDirectory())
+            return;
 
-        auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory();
-        auto projectResourcesDir = exeDir.getChildFile ("Resources");
-        if (! projectResourcesDir.exists())
-            projectResourcesDir = juce::File ("E:/ToneForge/Resources");
-
-        if (projectResourcesDir.exists())
+        auto copyFolder = [] (const juce::File& srcDir, const juce::File& dstDir, const juce::String& pattern)
         {
-            auto sourceModels = projectResourcesDir.getChildFile ("Models");
-            if (sourceModels.isDirectory())
+            if (! srcDir.isDirectory())
+                return;
+            auto files = srcDir.findChildFiles (juce::File::findFiles, false, pattern);
+            for (const auto& f : files)
             {
-                auto files = sourceModels.findChildFiles (juce::File::findFiles, false, "*.nam;*.json");
-                for (const auto& f : files)
-                {
-                    auto dest = modelsDir.getChildFile (f.getFileName());
-                    if (! dest.existsAsFile())
-                        f.copyFileTo (dest);
-                }
+                auto dest = dstDir.getChildFile (f.getFileName());
+                if (! dest.existsAsFile())
+                    f.copyFileTo (dest);
             }
+        };
 
-            auto sourceIrs = projectResourcesDir.getChildFile ("IRs");
-            if (sourceIrs.isDirectory())
-            {
-                auto files = sourceIrs.findChildFiles (juce::File::findFiles, false, "*.wav");
-                for (const auto& f : files)
-                {
-                    auto dest = irsDir.getChildFile (f.getFileName());
-                    if (! dest.existsAsFile())
-                        f.copyFileTo (dest);
-                }
-            }
-        }
+        copyFolder (projectResourcesDir.getChildFile ("Models"), modelsDir, "*.nam;*.json");
+        copyFolder (projectResourcesDir.getChildFile ("IRs"), irsDir, "*.wav");
+        copyFolder (projectResourcesDir.getChildFile ("Pedals"), pedalsDir, "*.tfpedal;*.xml");
     }
 
     static std::vector<TonePreset> getFactoryPresets()
     {
         deployFactoryResources();
 
-        auto modelsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Models");
-        auto irsDir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                            .getChildFile ("ToneForge")
-                            .getChildFile ("IRs");
+        auto modelsDir = getModelsFolder();
+        auto irsDir = getIrsFolder();
 
         std::vector<TonePreset> list;
 
@@ -266,7 +272,7 @@ public:
             p.customIrPath = irsDir.getChildFile ("Deftones - 2000 White Pony.wav").getFullPathName();
             p.delayOn = false;
             p.reverbOn = false;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
@@ -285,7 +291,7 @@ public:
             p.customIrPath = irsDir.getChildFile ("Deftones - White Pony Marshall 4x12.wav").getFullPathName();
             p.delayOn = true; p.delayTimeMs = 420.0f; p.delayFeedback = 0.35f; p.delayTone = 0.50f; p.delayMix = 0.22f;
             p.reverbOn = true; p.reverbDecay = 0.60f; p.reverbDamping = 0.30f; p.reverbMix = 0.20f;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
@@ -304,7 +310,7 @@ public:
             p.customIrPath = irsDir.getChildFile ("Orange 4x12 V30 SM57 - Enhanced.wav").getFullPathName();
             p.delayOn = true; p.delayTimeMs = 380.0f; p.delayFeedback = 0.30f; p.delayTone = 0.60f; p.delayMix = 0.18f;
             p.reverbOn = true; p.reverbDecay = 0.55f; p.reverbDamping = 0.35f; p.reverbMix = 0.18f;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
@@ -323,7 +329,7 @@ public:
             p.customIrPath = irsDir.getChildFile ("Orange 4x12 V30 - Studio Mix 70-30.wav").getFullPathName();
             p.delayOn = false;
             p.reverbOn = true; p.reverbDecay = 0.40f; p.reverbDamping = 0.40f; p.reverbMix = 0.15f;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
@@ -342,11 +348,11 @@ public:
             p.customIrPath = irsDir.getChildFile ("Deftones - 1997 Around The Fur.wav").getFullPathName();
             p.delayOn = false;
             p.reverbOn = false;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
-        // 6. Modern Metal Lead
+        // 6. Modern Metal Lead (Built-in Amp)
         {
             TonePreset p;
             p.name = "Modern Metal Lead";
@@ -358,7 +364,7 @@ public:
             p.cabOn = true; p.cabModel = 0; // 4x12 V30
             p.delayOn = true; p.delayTimeMs = 420.0f; p.delayFeedback = 0.35f; p.delayTone = 0.50f; p.delayMix = 0.22f;
             p.reverbOn = true; p.reverbDecay = 0.60f; p.reverbDamping = 0.30f; p.reverbMix = 0.20f;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 
@@ -374,7 +380,7 @@ public:
             p.cabOn = true; p.cabModel = 2; // 1x12 American
             p.delayOn = true; p.delayTimeMs = 520.0f; p.delayFeedback = 0.45f; p.delayTone = 0.70f; p.delayMix = 0.35f;
             p.reverbOn = true; p.reverbDecay = 0.80f; p.reverbDamping = 0.25f; p.reverbMix = 0.40f;
-            p.outputDb = -50.0f;
+            p.outputDb = -6.0f;
             list.push_back (p);
         }
 

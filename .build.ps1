@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Build, deploy, and optionally run ToneForge.
 .DESCRIPTION
@@ -65,7 +65,19 @@ if ($Configuration -eq "Release") {
 
     New-Item -ItemType Directory -Path $deployDir -Force | Out-Null
     Copy-Item -Path "$outDir\*" -Destination $deployDir -Recurse -Force
-    Write-Host "Deployed Release binaries to $deployDir" -ForegroundColor Green
+
+    # Deploy factory Resources (Models, IRs, Pedals) alongside the executable
+    $resSrc = Join-Path $repoRoot "Resources"
+    $resDst = Join-Path $deployDir "Resources"
+    foreach ($sub in @("Models", "IRs", "Pedals")) {
+        $srcSub = Join-Path $resSrc $sub
+        if (Test-Path $srcSub) {
+            $dstSub = Join-Path $resDst $sub
+            New-Item -ItemType Directory -Path $dstSub -Force | Out-Null
+            Copy-Item -Path "$srcSub\*" -Destination $dstSub -Force
+        }
+    }
+    Write-Host "Deployed Release binaries and Resources to $deployDir" -ForegroundColor Green
 }
 
 if ($Run) {

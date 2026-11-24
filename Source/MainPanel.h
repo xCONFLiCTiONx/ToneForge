@@ -29,6 +29,7 @@ private:
     void browseCustomPedal();
     void browseCustomReverbIr();
     void updateTelemetryString();
+    void updateCabStatusLabel();
 
     ToneForgeAudio& audio;
     juce::AudioDeviceManager& deviceManager;
@@ -49,7 +50,7 @@ private:
     juce::Label tunerNoteLabel;
     juce::Label tunerCentsLabel;
     juce::Label tunerFreqLabel;
-    juce::ToggleButton tunerMuteButton { "MUTE FOR TUNING" };
+    juce::ToggleButton tunerMuteButton { "TUNE MUTE" };
     float visualCents = 0.0f;
 
     // Rack Modules
@@ -84,9 +85,18 @@ private:
     // 5. Cabinet / IR
     juce::ToggleButton cabToggle { "CABINET / IR" };
     juce::ComboBox cabModelSelector;
-    juce::TextButton loadIrButton { "LOAD IR (.WAV)" };
+    juce::ComboBox cabIrSelector;
+    juce::TextButton loadIrButton { "BROWSE IR" };
     juce::Label irFileNameLabel;
     std::unique_ptr<juce::FileChooser> fileChooser;
+
+    struct DiscoveredFile
+    {
+        juce::String name;
+        juce::File file;
+    };
+    std::vector<DiscoveredFile> discoveredIrs;
+    void refreshCabIrList (const juce::String& irPathToSelect = "");
 
     // 6. Delay
     juce::ToggleButton delayToggle { "STEREO DELAY" };
@@ -98,6 +108,7 @@ private:
     // 7. Reverb
     juce::ToggleButton reverbToggle { "LUSH REVERB" };
     juce::TextButton loadReverbIrButton { "LOAD IR (.WAV)" };
+    juce::TextButton clearReverbIrButton { "RESET" };
     juce::Label reverbFileNameLabel;
     juce::Slider reverbDecaySlider;
     juce::Slider reverbDampingSlider;
@@ -105,11 +116,16 @@ private:
 
     // 8. External VST3 Plugin
     juce::ToggleButton vst3Toggle { "EXTERNAL VST3 PLUGIN" };
-    juce::TextButton loadVst3Button { "LOAD VST3..." };
-    juce::TextButton openVst3UiButton { "OPEN PLUGIN UI" };
+    juce::ComboBox vst3PositionSelector;
+    juce::ComboBox vst3PluginSelector;
+    juce::TextButton openVst3UiButton { "OPEN UI" };
+    juce::TextButton rescanVst3Button { "RESCAN" };
     juce::TextButton unloadVst3Button { "UNLOAD" };
     juce::Label vst3PluginNameLabel;
+    std::vector<DiscoveredFile> discoveredVst3Plugins;
 
+    void refreshVst3PluginList (const juce::String& pluginPathToSelect = "");
+    void loadVst3FromFile (const juce::File& file, const juce::String& stateBase64 = {});
     void browseVst3Plugin();
     void openVst3EditorWindow();
     void unloadVst3Plugin();
@@ -123,13 +139,7 @@ private:
     juce::Label namModelNameLabel;
     juce::Slider namInputGainSlider;
     juce::Slider namOutputGainSlider;
-
-    struct DiscoveredNamModel
-    {
-        juce::String name;
-        juce::File file;
-    };
-    std::vector<DiscoveredNamModel> discoveredNamModels;
+    std::vector<DiscoveredFile> discoveredNamModels;
 
     void refreshNamModelList (const juce::String& modelPathToSelect = "");
     void browseNamModel();
@@ -148,25 +158,29 @@ private:
     juce::OwnedArray<juce::Label> knobLabels;
     std::unordered_map<juce::Slider*, juce::Label*> sliderLabelMap;
 
-    class Vst3PluginWindow : public juce::DocumentWindow
+    class Vst3PluginWindow final : public juce::DocumentWindow
     {
     public:
         Vst3PluginWindow (const juce::String& name, juce::AudioProcessorEditor* editor)
             : juce::DocumentWindow (name, juce::Colour (0xff191a1c), juce::DocumentWindow::allButtons)
         {
             setOpaque (true);
+            setUsingNativeTitleBar (true);
             if (editor != nullptr)
             {
-                setContentNonOwned (editor, true);
+                setContentOwned (editor, true);
                 setResizable (editor->isResizable(), false);
             }
-            setUsingNativeTitleBar (true);
+            centreWithSize (getWidth(), getHeight());
         }
 
         void closeButtonPressed() override
         {
             setVisible (false);
         }
+
+    private:
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Vst3PluginWindow)
     };
 
     std::unique_ptr<Vst3PluginWindow> vst3Window;
@@ -187,7 +201,7 @@ private:
 
     float visualInputRms = 0.0f;
     float visualOutputRms = 0.0f;
+    int telemetryTickCounter = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainPanel)
 };
-

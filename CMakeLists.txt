@@ -77,13 +77,22 @@ set_target_properties(ToneForge PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/Release"
 )
 
-# Convenience: deploy the executable directly to the top-level bin/ folder
+# Convenience: deploy the executable and factory Resources directly to the top-level bin/ folder
 add_custom_command(TARGET ToneForge POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:ToneForge>"
         "${CMAKE_CURRENT_SOURCE_DIR}/bin/$<TARGET_FILE_NAME:ToneForge>"
-    COMMENT "Deploying ToneForge.exe to project bin/ folder"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Models"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/Resources/Models"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Resources/IRs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/Resources/IRs"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Pedals"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/Resources/Pedals"
+    COMMENT "Deploying ToneForge.exe and Resources to project bin/ folder"
 )
 
 target_sources(ToneForge PRIVATE

@@ -1,10 +1,14 @@
 #include "MainPanel.h"
+#include <unordered_set>
 
 MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManager, juce::ApplicationProperties& appProps)
     : audio (engine), deviceManager (devManager), appProperties (appProps)
 {
     setOpaque (true);
     setLookAndFeel (&lookAndFeel);
+
+    // Ensure factory Models, IRs, and Pedals exist in AppData before populating dropdowns
+    PresetManager::deployFactoryResources();
 
     // Title
     appTitle.setText ("TONEFORGE", juce::dontSendNotification);
@@ -23,7 +27,7 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     savePresetButton.onClick = [this] { promptSaveProfile(); };
     addAndMakeVisible (savePresetButton);
 
-    // Input Source (Critical for Focusrite Scarlett Solo!)
+    // Input Source (Critical for Focusrite Scarlett Solo)
     inputSourceLabel.setText ("INPUT:", juce::dontSendNotification);
     inputSourceLabel.setFont (juce::Font (juce::FontOptions (11.5f, juce::Font::bold)));
     inputSourceLabel.setColour (juce::Label::textColourId, juce::Colour (0xffa2a6b2));
@@ -52,12 +56,11 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     audioSettingsButton.onClick = [this] { openAudioSettings(); };
     addAndMakeVisible (audioSettingsButton);
 
-    // Master Mute
-    bool isMutedDefault = true;
+    // Master Mute (defaults to UNMUTED so guitar is immediately audible)
+    bool isMutedDefault = false;
     if (auto* userSettings = appProperties.getUserSettings())
-        isMutedDefault = userSettings->getBoolValue ("masterMute", true);
+        isMutedDefault = userSettings->getBoolValue ("masterMute", false);
 
-    masterMuteButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffe63946));
     masterMuteButton.setToggleState (isMutedDefault, juce::dontSendNotification);
     audio.masterMute.store (isMutedDefault);
     masterMuteButton.onStateChange = [this]
@@ -74,7 +77,7 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
 
     // Tuner HUD
     tunerNoteLabel.setText ("--", juce::dontSendNotification);
-    tunerNoteLabel.setFont (juce::Font (juce::FontOptions (28.0f, juce::Font::bold)));
+    tunerNoteLabel.setFont (juce::Font (juce::FontOptions (26.0f, juce::Font::bold)));
     tunerNoteLabel.setJustificationType (juce::Justification::centred);
     tunerNoteLabel.setColour (juce::Label::textColourId, juce::Colour (0xffffffff));
     addAndMakeVisible (tunerNoteLabel);
@@ -91,6 +94,7 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     tunerFreqLabel.setColour (juce::Label::textColourId, juce::Colour (0xff7e8494));
     addAndMakeVisible (tunerFreqLabel);
 
+    tunerMuteButton.setTooltip ("Mute audio output while tuning");
     tunerMuteButton.onStateChange = [this] { audio.tunerMute.store (tunerMuteButton.getToggleState()); };
     addAndMakeVisible (tunerMuteButton);
 
@@ -125,9 +129,7 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     {
         int id = driveVoicingSelector.getSelectedId();
         if (id > 0)
-        {
             audio.overdriveVoicing.store (id - 1);
-        }
     };
     addAndMakeVisible (driveVoicingSelector);
 
@@ -168,21 +170,56 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     // 5. Cabinet / IR Module
     setupToggle (cabToggle, "CABINET / IR", true);
     cabToggle.onStateChange = [this] { audio.cabinetEnabled.store (cabToggle.getToggleState()); };
-    cabModelSelector.addItem ("4x12 Vintage 30 (Punchy)", 1);
-    cabModelSelector.addItem ("2x12 British Greenback", 2);
-    cabModelSelector.addItem ("1x12 American Deluxe", 3);
+    cabModelSelector.addItem ("4x12 Vintage 30 (Built-in)", 1);
+    cabModelSelector.addItem ("2x12 British Greenback (Built-in)", 2);
+    cabModelSelector.addItem ("1x12 American Deluxe (Built-in)", 3);
     cabModelSelector.addItem ("Custom IR (.wav file)", 4);
     cabModelSelector.setSelectedId (1, juce::dontSendNotification);
-    cabModelSelector.onChange = [this] { audio.cabModel.store (static_cast<int> (cabModelSelector.getSelectedId() - 1)); };
+    cabModelSelector.onChange = [this]
+    {
+        audio.cabModel.store (static_cast<int> (cabModelSelector.getSelectedId() - 1));
+        updateCabStatusLabel();
+    };
     addAndMakeVisible (cabModelSelector);
 
+    cabIrSelector.onChange = [this]
+    {
+        int id = cabIrSelector.getSelectedId();
+        if (id <= 1)
+            return;
+
+        int browseId = static_cast<int> (discoveredIrs.size() + 2);
+        if (id == browseId)
+        {
+            browseCustomIr();
+        }
+        else if (id >= 2 && id < browseId)
+        {
+            size_t idx = static_cast<size_t> (id - 2);
+            if (idx < discoveredIrs.size())
+            {
+                if (audio.loadCustomIrFile (discoveredIrs[idx].file))
+                {
+                    cabModelSelector.setSelectedId (4, juce::dontSendNotification);
+                    audio.cabModel.store (static_cast<int> (CabType::CustomIR));
+                    cabToggle.setToggleState (true, juce::sendNotification);
+                    updateCabStatusLabel();
+                }
+            }
+        }
+    };
+    addAndMakeVisible (cabIrSelector);
+
+    loadIrButton.setTooltip ("Browse for a custom cabinet impulse response (.wav)");
     loadIrButton.onClick = [this] { browseCustomIr(); };
     addAndMakeVisible (loadIrButton);
 
-    irFileNameLabel.setText ("Built-in V30 IR Active", juce::dontSendNotification);
-    irFileNameLabel.setFont (juce::Font (juce::FontOptions (11.0f)));
+    irFileNameLabel.setText ("Built-in 4x12 V30 Active", juce::dontSendNotification);
+    irFileNameLabel.setFont (juce::Font (juce::FontOptions (10.5f)));
     irFileNameLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f94a4));
     addAndMakeVisible (irFileNameLabel);
+
+    refreshCabIrList();
 
     // 6. Delay Module
     setupToggle (delayToggle, "STEREO DELAY", true);
@@ -203,6 +240,14 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     loadReverbIrButton.onClick = [this] { browseCustomReverbIr(); };
     addAndMakeVisible (loadReverbIrButton);
 
+    clearReverbIrButton.setTooltip ("Reset back to built-in studio Plate/Hall reverb");
+    clearReverbIrButton.onClick = [this]
+    {
+        audio.unloadCustomReverbIr();
+        reverbFileNameLabel.setText ("Built-in Plate/Hall", juce::dontSendNotification);
+    };
+    addAndMakeVisible (clearReverbIrButton);
+
     reverbFileNameLabel.setText ("Built-in Plate/Hall", juce::dontSendNotification);
     reverbFileNameLabel.setFont (juce::Font (juce::FontOptions (10.5f)));
     reverbFileNameLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f94a4));
@@ -219,13 +264,45 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     setupToggle (vst3Toggle, "EXTERNAL VST3 PLUGIN", false);
     vst3Toggle.onStateChange = [this] { audio.vst3Enabled.store (vst3Toggle.getToggleState()); };
 
-    loadVst3Button.setTooltip ("Load external 64-bit VST3 audio plugin (.vst3)");
-    loadVst3Button.onClick = [this] { browseVst3Plugin(); };
-    addAndMakeVisible (loadVst3Button);
+    vst3PositionSelector.addItem ("Pre-Amp", 1);
+    vst3PositionSelector.addItem ("Post-Cab", 2);
+    vst3PositionSelector.setSelectedId (2, juce::dontSendNotification);
+    vst3PositionSelector.setTooltip ("Choose where the VST3 plugin sits in the guitar signal chain");
+    vst3PositionSelector.onChange = [this]
+    {
+        audio.vst3Position.store (vst3PositionSelector.getSelectedId() == 1
+                                      ? static_cast<int> (Vst3SlotPosition::PreAmp)
+                                      : static_cast<int> (Vst3SlotPosition::PostCab));
+    };
+    addAndMakeVisible (vst3PositionSelector);
+
+    vst3PluginSelector.onChange = [this]
+    {
+        int id = vst3PluginSelector.getSelectedId();
+        if (id <= 1)
+            return;
+
+        int browseId = static_cast<int> (discoveredVst3Plugins.size() + 2);
+        if (id == browseId)
+        {
+            browseVst3Plugin();
+        }
+        else if (id >= 2 && id < browseId)
+        {
+            size_t idx = static_cast<size_t> (id - 2);
+            if (idx < discoveredVst3Plugins.size())
+                loadVst3FromFile (discoveredVst3Plugins[idx].file);
+        }
+    };
+    addAndMakeVisible (vst3PluginSelector);
 
     openVst3UiButton.setTooltip ("Open graphical UI window for loaded VST3 plugin");
     openVst3UiButton.onClick = [this] { openVst3EditorWindow(); };
     addAndMakeVisible (openVst3UiButton);
+
+    rescanVst3Button.setTooltip ("Rescan system VST3 folders for newly installed plugins");
+    rescanVst3Button.onClick = [this] { refreshVst3PluginList (audio.vst3PluginPath); };
+    addAndMakeVisible (rescanVst3Button);
 
     unloadVst3Button.setTooltip ("Unload current VST3 plugin");
     unloadVst3Button.onClick = [this] { unloadVst3Plugin(); };
@@ -235,6 +312,8 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     vst3PluginNameLabel.setFont (juce::Font (juce::FontOptions (11.0f)));
     vst3PluginNameLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f94a4));
     addAndMakeVisible (vst3PluginNameLabel);
+
+    refreshVst3PluginList();
 
     // 9. Neural Amp Modeler (NAM) Module
     setupToggle (namToggle, "NEURAL AMP MODELER (NAM)", false);
@@ -265,8 +344,8 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
                 else
                 {
                     juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                             "NAM Model Load Error",
-                                                             err, "OK", this);
+                                                            "NAM Model Load Error",
+                                                            err, "OK", this);
                 }
             }
         }
@@ -307,13 +386,13 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
     inputMeterLabel.setColour (juce::Label::textColourId, juce::Colour (0xffa2a6b2));
     addAndMakeVisible (inputMeterLabel);
 
-    hardwareStatusLabel.setText ("Focusrite Solo 4th Gen • ASIO Ready", juce::dontSendNotification);
+    hardwareStatusLabel.setText ("Audio Engine Ready", juce::dontSendNotification);
     hardwareStatusLabel.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
     hardwareStatusLabel.setJustificationType (juce::Justification::centred);
     hardwareStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff0ba4f0));
     addAndMakeVisible (hardwareStatusLabel);
 
-    setupKnob (outputSlider, "MASTER VOL", -60.0, 6.0, -50.0, " dB");
+    setupKnob (outputSlider, "MASTER VOL", -60.0, 6.0, -6.0, " dB");
     outputSlider.onValueChange = [this] { audio.outputDb.store (static_cast<float> (outputSlider.getValue())); };
 
     outputMeterLabel.setText ("OUT: -inf dB", juce::dontSendNotification);
@@ -342,6 +421,7 @@ MainPanel::MainPanel (ToneForgeAudio& engine, juce::AudioDeviceManager& devManag
         }
     };
 
+    updateTelemetryString();
     startTimerHz (30);
 }
 
@@ -349,8 +429,8 @@ MainPanel::~MainPanel()
 {
     stopTimer();
     saveCurrentPresetState();
-    if (vst3Window != nullptr)
-        vst3Window.reset();
+    // Always destroy VST3 editor window BEFORE ToneForgeAudio unloads the plugin instance
+    vst3Window.reset();
     setLookAndFeel (nullptr);
 }
 
@@ -378,9 +458,7 @@ void MainPanel::layoutKnob (juce::Rectangle<int> bounds, juce::Slider& slider)
 {
     auto it = sliderLabelMap.find (&slider);
     if (it != sliderLabelMap.end() && it->second != nullptr)
-    {
         it->second->setBounds (bounds.removeFromTop (16));
-    }
     slider.setBounds (bounds.reduced (1, 0));
 }
 
@@ -392,12 +470,10 @@ void MainPanel::drawModuleCard (juce::Graphics& g, juce::Rectangle<int> bounds, 
     auto fBounds = bounds.toFloat();
     const float corner = 6.0f;
 
-    // Card chassis body
     juce::Colour cardBg = isEnabled ? juce::Colour (0xff202228) : juce::Colour (0xff191a1c);
     g.setColour (cardBg);
     g.fillRoundedRectangle (fBounds, corner);
 
-    // Card header bar plate
     auto headerBar = bounds.removeFromTop (28).toFloat();
     juce::Path headerPath;
     headerPath.addRoundedRectangle (headerBar.getX(), headerBar.getY(), headerBar.getWidth(), headerBar.getHeight(),
@@ -405,16 +481,13 @@ void MainPanel::drawModuleCard (juce::Graphics& g, juce::Rectangle<int> bounds, 
     g.setColour (isEnabled ? juce::Colour (0xff282b33) : juce::Colour (0xff1e2025));
     g.fillPath (headerPath);
 
-    // Subtle header bottom divider line
     g.setColour (juce::Colour (0xff333742));
-    g.drawHorizontalLine (bounds.getY() + 28, fBounds.getX(), fBounds.getRight());
+    g.drawHorizontalLine (bounds.getY(), fBounds.getX(), fBounds.getRight());
 
-    // Card outline border
     juce::Colour borderCol = isEnabled ? juce::Colour (0xff393d4a) : juce::Colour (0xff252830);
     g.setColour (borderCol);
     g.drawRoundedRectangle (fBounds, corner, 1.0f);
 
-    // Subtle top accent line if enabled
     if (isEnabled)
     {
         g.setColour (accentColour.withAlpha (0.75f));
@@ -427,6 +500,21 @@ void MainPanel::setupToggle (juce::ToggleButton& btn, const juce::String& text, 
     btn.setButtonText (text);
     btn.setToggleState (init, juce::dontSendNotification);
     addAndMakeVisible (btn);
+}
+
+void MainPanel::updateCabStatusLabel()
+{
+    int id = cabModelSelector.getSelectedId();
+    if (id == 1)
+        irFileNameLabel.setText ("Built-in 4x12 V30 Active", juce::dontSendNotification);
+    else if (id == 2)
+        irFileNameLabel.setText ("Built-in 2x12 Greenback Active", juce::dontSendNotification);
+    else if (id == 3)
+        irFileNameLabel.setText ("Built-in 1x12 American Active", juce::dontSendNotification);
+    else if (audio.hasCustomIrLoaded.load())
+        irFileNameLabel.setText ("IR: " + audio.customIrName, juce::dontSendNotification);
+    else
+        irFileNameLabel.setText ("No Custom IR Loaded", juce::dontSendNotification);
 }
 
 void MainPanel::applyPreset (int index)
@@ -453,8 +541,10 @@ void MainPanel::applyPreset (int index)
     if (p.driveVoicing == 6 && p.customPedalPath.isNotEmpty())
     {
         juce::File pedalFile (p.customPedalPath);
-        if (pedalFile.existsAsFile())
-            audio.loadCustomPedalFile (pedalFile);
+        if (! pedalFile.existsAsFile())
+            pedalFile = PresetManager::getPedalsFolder().getChildFile (pedalFile.getFileName());
+        if (pedalFile.existsAsFile() && audio.loadCustomPedalFile (pedalFile))
+            driveVoicingSelector.changeItemText (7, "Custom: " + audio.customPedalName);
     }
 
     ampToggle.setToggleState (p.ampOn, juce::sendNotification);
@@ -474,31 +564,26 @@ void MainPanel::applyPreset (int index)
     {
         juce::File irFile (p.customIrPath);
         if (! irFile.existsAsFile())
+            irFile = PresetManager::getIrsFolder().getChildFile (irFile.getFileName());
+        if (! irFile.existsAsFile())
         {
-            auto appDataIrs = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                    .getChildFile ("ToneForge")
-                                    .getChildFile ("IRs");
-            irFile = appDataIrs.getChildFile (juce::File (p.customIrPath).getFileName());
-
-            if (! irFile.existsAsFile())
-            {
-                auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory();
-                irFile = exeDir.getChildFile ("Resources").getChildFile ("IRs").getChildFile (juce::File (p.customIrPath).getFileName());
-                if (! irFile.existsAsFile())
-                    irFile = juce::File ("E:/ToneForge/Resources/IRs").getChildFile (juce::File (p.customIrPath).getFileName());
-            }
+            auto resDir = PresetManager::findProjectResourcesDir();
+            if (resDir.isDirectory())
+                irFile = resDir.getChildFile ("IRs").getChildFile (juce::File (p.customIrPath).getFileName());
         }
 
-        if (irFile.existsAsFile())
+        if (irFile.existsAsFile() && audio.loadCustomIrFile (irFile))
         {
-            if (audio.loadCustomIrFile (irFile))
-            {
-                cabModelSelector.setSelectedId (4, juce::dontSendNotification);
-                audio.cabModel.store (static_cast<int> (CabType::CustomIR));
-                irFileNameLabel.setText (irFile.getFileName(), juce::dontSendNotification);
-            }
+            cabModelSelector.setSelectedId (4, juce::dontSendNotification);
+            audio.cabModel.store (static_cast<int> (CabType::CustomIR));
+            refreshCabIrList (irFile.getFullPathName());
         }
     }
+    else
+    {
+        cabIrSelector.setSelectedId (1, juce::dontSendNotification);
+    }
+    updateCabStatusLabel();
 
     delayToggle.setToggleState (p.delayOn, juce::sendNotification);
     delayTimeSlider.setValue (p.delayTimeMs, juce::sendNotification);
@@ -513,30 +598,42 @@ void MainPanel::applyPreset (int index)
     if (p.customReverbPath.isNotEmpty())
     {
         juce::File revFile (p.customReverbPath);
-        if (revFile.existsAsFile())
+        if (revFile.existsAsFile() && audio.loadCustomReverbIrFile (revFile))
+            reverbFileNameLabel.setText (revFile.getFileName(), juce::dontSendNotification);
+        else
         {
-            if (audio.loadCustomReverbIrFile (revFile))
-                reverbFileNameLabel.setText (revFile.getFileName(), juce::dontSendNotification);
+            audio.unloadCustomReverbIr();
+            reverbFileNameLabel.setText ("Built-in Plate/Hall", juce::dontSendNotification);
         }
     }
     else
     {
-        audio.hasCustomReverbLoaded = false;
+        audio.unloadCustomReverbIr();
         reverbFileNameLabel.setText ("Built-in Plate/Hall", juce::dontSendNotification);
     }
 
-    vst3Toggle.setToggleState (p.vst3On, juce::sendNotification);
+    // VST3 Plugin restore or clean unload
+    vst3PositionSelector.setSelectedId (p.vst3Position == 0 ? 1 : 2, juce::dontSendNotification);
+    audio.vst3Position.store (p.vst3Position);
     if (p.vst3PluginPath.isNotEmpty())
     {
         juce::File vstFile (p.vst3PluginPath);
         if (vstFile.exists())
         {
-            juce::String err;
-            if (audio.loadVst3Plugin (vstFile, err))
-                vst3PluginNameLabel.setText (audio.vst3PluginName, juce::dontSendNotification);
+            loadVst3FromFile (vstFile, p.vst3StateBase64);
+            vst3Toggle.setToggleState (p.vst3On, juce::sendNotification);
+        }
+        else
+        {
+            unloadVst3Plugin();
         }
     }
+    else
+    {
+        unloadVst3Plugin();
+    }
 
+    // NAM Model restore or clean unload
     namToggle.setToggleState (p.namOn, juce::sendNotification);
     namInputGainSlider.setValue (p.namInputGainDb, juce::sendNotification);
     namOutputGainSlider.setValue (p.namOutputGainDb, juce::sendNotification);
@@ -544,19 +641,12 @@ void MainPanel::applyPreset (int index)
     {
         juce::File namFile (p.namModelPath);
         if (! namFile.existsAsFile())
+            namFile = PresetManager::getModelsFolder().getChildFile (namFile.getFileName());
+        if (! namFile.existsAsFile())
         {
-            auto appDataModels = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                        .getChildFile ("ToneForge")
-                                        .getChildFile ("Models");
-            namFile = appDataModels.getChildFile (juce::File (p.namModelPath).getFileName());
-
-            if (! namFile.existsAsFile())
-            {
-                auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory();
-                namFile = exeDir.getChildFile ("Resources").getChildFile ("Models").getChildFile (juce::File (p.namModelPath).getFileName());
-                if (! namFile.existsAsFile())
-                    namFile = juce::File ("E:/ToneForge/Resources/Models").getChildFile (juce::File (p.namModelPath).getFileName());
-            }
+            auto resDir = PresetManager::findProjectResourcesDir();
+            if (resDir.isDirectory())
+                namFile = resDir.getChildFile ("Models").getChildFile (juce::File (p.namModelPath).getFileName());
         }
 
         if (namFile.existsAsFile())
@@ -566,6 +656,7 @@ void MainPanel::applyPreset (int index)
             {
                 namModelNameLabel.setText (audio.namModelName, juce::dontSendNotification);
                 refreshNamModelList (namFile.getFullPathName());
+                namToggle.setToggleState (p.namOn, juce::sendNotification);
             }
         }
     }
@@ -586,10 +677,7 @@ void MainPanel::promptSaveProfile()
     if (currentIdx >= 0 && currentIdx < static_cast<int> (presets.size()))
     {
         const auto& cur = presets[static_cast<size_t> (currentIdx)];
-        if (cur.isUserPreset)
-            defaultName = cur.name;
-        else
-            defaultName = cur.name + " (Custom)";
+        defaultName = cur.isUserPreset ? cur.name : (cur.name + " (Custom)");
     }
 
     auto* alert = new juce::AlertWindow ("SAVE PROFILE",
@@ -661,7 +749,9 @@ void MainPanel::saveProfileWithName (const juce::String& name)
     p.customReverbPath = audio.customReverbPath;
 
     p.vst3On = vst3Toggle.getToggleState();
+    p.vst3Position = audio.vst3Position.load();
     p.vst3PluginPath = audio.vst3PluginPath;
+    p.vst3StateBase64 = audio.getVst3StateBase64();
 
     p.namOn = namToggle.getToggleState();
     p.namModelPath = audio.namModelPath;
@@ -693,63 +783,7 @@ void MainPanel::saveCurrentPresetState()
         }
 
         if (presets[static_cast<size_t> (idx)].isUserPreset)
-        {
-            TonePreset p;
-            p.name = presets[static_cast<size_t> (idx)].name;
-            p.isUserPreset = true;
-
-            p.gateOn = gateToggle.getToggleState();
-            p.gateThreshDb = static_cast<float> (gateThresholdSlider.getValue());
-            p.gateReleaseMs = static_cast<float> (gateReleaseSlider.getValue());
-
-            p.compOn = compToggle.getToggleState();
-            p.compAmount = static_cast<float> (compAmountSlider.getValue());
-            p.compAttackMs = static_cast<float> (compAttackSlider.getValue());
-
-            p.driveOn = driveToggle.getToggleState();
-            p.driveVoicing = driveVoicingSelector.getSelectedId() - 1;
-            p.driveGain = static_cast<float> (driveGainSlider.getValue());
-            p.driveTone = static_cast<float> (driveToneSlider.getValue());
-            p.driveLevel = static_cast<float> (driveLevelSlider.getValue());
-            p.customPedalPath = audio.customPedalPath;
-
-            p.ampOn = ampToggle.getToggleState();
-            p.ampChannel = ampVoicingSelector.getSelectedId() - 1;
-            p.ampGain = static_cast<float> (ampGainSlider.getValue());
-            p.ampBass = static_cast<float> (ampBassSlider.getValue());
-            p.ampMiddle = static_cast<float> (ampMidSlider.getValue());
-            p.ampTreble = static_cast<float> (ampTrebleSlider.getValue());
-            p.ampPresence = static_cast<float> (ampPresenceSlider.getValue());
-            p.ampMaster = static_cast<float> (ampMasterSlider.getValue());
-
-            p.cabOn = cabToggle.getToggleState();
-            p.cabModel = cabModelSelector.getSelectedId() - 1;
-            p.customIrPath = audio.customIrPath;
-
-            p.delayOn = delayToggle.getToggleState();
-            p.delayTimeMs = static_cast<float> (delayTimeSlider.getValue());
-            p.delayFeedback = static_cast<float> (delayFeedbackSlider.getValue());
-            p.delayTone = static_cast<float> (delayToneSlider.getValue());
-            p.delayMix = static_cast<float> (delayMixSlider.getValue());
-
-            p.reverbOn = reverbToggle.getToggleState();
-            p.reverbDecay = static_cast<float> (reverbDecaySlider.getValue());
-            p.reverbDamping = static_cast<float> (reverbDampingSlider.getValue());
-            p.reverbMix = static_cast<float> (reverbMixSlider.getValue());
-            p.customReverbPath = audio.customReverbPath;
-
-            p.vst3On = vst3Toggle.getToggleState();
-            p.vst3PluginPath = audio.vst3PluginPath;
-
-            p.namOn = namToggle.getToggleState();
-            p.namModelPath = audio.namModelPath;
-            p.namInputGainDb = static_cast<float> (namInputGainSlider.getValue());
-            p.namOutputGainDb = static_cast<float> (namOutputGainSlider.getValue());
-
-            p.outputDb = static_cast<float> (outputSlider.getValue());
-
-            PresetManager::saveUserPreset (p);
-        }
+            saveProfileWithName (presets[static_cast<size_t> (idx)].name);
     }
 }
 
@@ -798,12 +832,12 @@ void MainPanel::refreshPresetList (const juce::String& presetNameToSelect)
 void MainPanel::openAudioSettings()
 {
     auto* selector = new juce::AudioDeviceSelectorComponent (deviceManager,
-                                                             1, 2,  // min/max inputs
-                                                             1, 2,  // min/max outputs
-                                                             true,  // show MIDI in
-                                                             false, // show MIDI out
-                                                             true,  // show channels as stereo pairs
-                                                             false); // hide advanced
+                                                             1, 2,
+                                                             1, 2,
+                                                             true,
+                                                             false,
+                                                             true,
+                                                             false);
     selector->setSize (540, 480);
 
     juce::DialogWindow::LaunchOptions opt;
@@ -816,13 +850,53 @@ void MainPanel::openAudioSettings()
     opt.launchAsync();
 }
 
+void MainPanel::refreshCabIrList (const juce::String& irPathToSelect)
+{
+    discoveredIrs.clear();
+    cabIrSelector.clear (juce::dontSendNotification);
+
+    auto irsDir = PresetManager::getIrsFolder();
+    std::unordered_set<juce::String> seen;
+
+    if (irsDir.isDirectory())
+    {
+        auto files = irsDir.findChildFiles (juce::File::findFiles, true, "*.wav");
+        for (const auto& f : files)
+        {
+            auto path = f.getFullPathName();
+            if (seen.insert (path).second)
+                discoveredIrs.push_back ({ f.getFileNameWithoutExtension(), f });
+        }
+    }
+
+    std::sort (discoveredIrs.begin(), discoveredIrs.end(), [] (const DiscoveredFile& a, const DiscoveredFile& b)
+    {
+        return a.name.compareIgnoreCase (b.name) < 0;
+    });
+
+    cabIrSelector.addItem ("-- Select Cabinet IR --", 1);
+    int selectedId = 1;
+    for (size_t i = 0; i < discoveredIrs.size(); ++i)
+    {
+        int itemId = static_cast<int> (i + 2);
+        cabIrSelector.addItem (discoveredIrs[i].name, itemId);
+        if (irPathToSelect.isNotEmpty() && discoveredIrs[i].file.getFullPathName().equalsIgnoreCase (irPathToSelect))
+            selectedId = itemId;
+    }
+
+    cabIrSelector.addSeparator();
+    cabIrSelector.addItem ("Browse for .wav IR...", static_cast<int> (discoveredIrs.size() + 2));
+    cabIrSelector.setSelectedId (selectedId, juce::dontSendNotification);
+}
+
 void MainPanel::browseCustomIr()
 {
+    auto irsDir = PresetManager::getIrsFolder();
     fileChooser = std::make_unique<juce::FileChooser> ("Select Guitar Cabinet Impulse Response (.wav)",
-                                                        juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+                                                        irsDir.isDirectory() ? irsDir : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
                                                         "*.wav");
-    auto folderChooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
-    fileChooser->launchAsync (folderChooserFlags, [this] (const juce::FileChooser& fc)
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
     {
         auto file = fc.getResult();
         if (file.existsAsFile())
@@ -831,7 +905,9 @@ void MainPanel::browseCustomIr()
             {
                 cabModelSelector.setSelectedId (4, juce::dontSendNotification);
                 audio.cabModel.store (static_cast<int> (CabType::CustomIR));
-                irFileNameLabel.setText (file.getFileName(), juce::dontSendNotification);
+                cabToggle.setToggleState (true, juce::sendNotification);
+                refreshCabIrList (file.getFullPathName());
+                updateCabStatusLabel();
             }
         }
     });
@@ -839,23 +915,19 @@ void MainPanel::browseCustomIr()
 
 void MainPanel::browseCustomPedal()
 {
-    auto userPedalFolder = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Pedals");
-    if (! userPedalFolder.exists())
-        userPedalFolder.createDirectory();
-
+    auto userPedalFolder = PresetManager::getPedalsFolder();
     fileChooser = std::make_unique<juce::FileChooser> ("Select Distortion Pedal File (.tfpedal, .xml, .wav, .nam)",
-                                                        userPedalFolder.exists() ? userPedalFolder : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+                                                        userPedalFolder.isDirectory() ? userPedalFolder : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
                                                         "*.tfpedal;*.xml;*.wav;*.nam;*.json");
-    auto folderChooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
-    fileChooser->launchAsync (folderChooserFlags, [this] (const juce::FileChooser& fc)
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
     {
         auto file = fc.getResult();
         if (file.existsAsFile())
         {
             if (audio.loadCustomPedalFile (file))
             {
+                driveVoicingSelector.changeItemText (7, "Custom: " + audio.customPedalName);
                 driveVoicingSelector.setSelectedId (7, juce::dontSendNotification);
                 driveToggle.setToggleState (true, juce::sendNotification);
             }
@@ -865,11 +937,12 @@ void MainPanel::browseCustomPedal()
 
 void MainPanel::browseCustomReverbIr()
 {
+    auto irsDir = PresetManager::getIrsFolder();
     fileChooser = std::make_unique<juce::FileChooser> ("Select Reverb Impulse Response (.wav)",
-                                                        juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+                                                        irsDir.isDirectory() ? irsDir : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
                                                         "*.wav");
-    auto folderChooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
-    fileChooser->launchAsync (folderChooserFlags, [this] (const juce::FileChooser& fc)
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
     {
         auto file = fc.getResult();
         if (file.existsAsFile())
@@ -883,34 +956,105 @@ void MainPanel::browseCustomReverbIr()
     });
 }
 
+void MainPanel::refreshVst3PluginList (const juce::String& pluginPathToSelect)
+{
+    discoveredVst3Plugins.clear();
+    vst3PluginSelector.clear (juce::dontSendNotification);
+
+    std::vector<juce::File> searchDirs;
+    searchDirs.emplace_back ("C:\\Program Files\\Common Files\\VST3");
+    searchDirs.emplace_back ("C:\\Program Files\\VST3");
+    auto localAppData = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                            .getParentDirectory().getChildFile ("Local");
+    searchDirs.push_back (localAppData.getChildFile ("Programs").getChildFile ("Common").getChildFile ("VST3"));
+    searchDirs.push_back (PresetManager::getAppDataSubfolder ("Plugins"));
+
+    std::unordered_set<juce::String> seenPaths;
+
+    for (const auto& dir : searchDirs)
+    {
+        if (! dir.isDirectory())
+            continue;
+
+        // Find both .vst3 bundle directories AND single-file .vst3 plugins
+        auto entries = dir.findChildFiles (juce::File::findFilesAndDirectories, false, "*.vst3");
+        for (const auto& entry : entries)
+        {
+            auto resolved = ToneForgeAudio::resolveVst3BundlePath (entry);
+            auto fullPath = resolved.getFullPathName();
+            if (seenPaths.insert (fullPath.toLowerCase()).second)
+                discoveredVst3Plugins.push_back ({ resolved.getFileNameWithoutExtension(), resolved });
+        }
+    }
+
+    std::sort (discoveredVst3Plugins.begin(), discoveredVst3Plugins.end(), [] (const DiscoveredFile& a, const DiscoveredFile& b)
+    {
+        return a.name.compareIgnoreCase (b.name) < 0;
+    });
+
+    vst3PluginSelector.addItem ("-- Select Installed VST3 Plugin --", 1);
+    int selectedId = 1;
+
+    for (size_t i = 0; i < discoveredVst3Plugins.size(); ++i)
+    {
+        int itemId = static_cast<int> (i + 2);
+        vst3PluginSelector.addItem (discoveredVst3Plugins[i].name, itemId);
+        if (pluginPathToSelect.isNotEmpty()
+            && discoveredVst3Plugins[i].file.getFullPathName().equalsIgnoreCase (pluginPathToSelect))
+        {
+            selectedId = itemId;
+        }
+    }
+
+    vst3PluginSelector.addSeparator();
+    vst3PluginSelector.addItem ("Browse for .vst3 File/Bundle...", static_cast<int> (discoveredVst3Plugins.size() + 2));
+    vst3PluginSelector.setSelectedId (selectedId, juce::dontSendNotification);
+}
+
+void MainPanel::loadVst3FromFile (const juce::File& file, const juce::String& stateBase64)
+{
+    // Always destroy any open plugin UI window BEFORE replacing the AudioProcessor instance
+    vst3Window.reset();
+
+    juce::String err;
+    if (audio.loadVst3Plugin (file, err))
+    {
+        if (stateBase64.isNotEmpty())
+            audio.setVst3StateBase64 (stateBase64);
+
+        vst3Toggle.setToggleState (true, juce::sendNotification);
+        vst3PluginNameLabel.setText (audio.vst3PluginName, juce::dontSendNotification);
+        refreshVst3PluginList (audio.vst3PluginPath);
+    }
+    else
+    {
+        vst3PluginSelector.setSelectedId (1, juce::dontSendNotification);
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                "VST3 Plugin Load Error",
+                                                err, "OK", this);
+    }
+}
+
 void MainPanel::browseVst3Plugin()
 {
     juce::File defaultVst3Dir ("C:\\Program Files\\Common Files\\VST3");
     if (! defaultVst3Dir.exists())
         defaultVst3Dir = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
 
-    fileChooser = std::make_unique<juce::FileChooser> ("Select 64-bit VST3 Plugin File or Bundle (.vst3)",
+    // On Windows, native dialogs cannot select both files and folders simultaneously;
+    // selecting files lets users pick either a single .vst3 file or the inner .vst3 binary inside Contents/x86_64-win/,
+    // and resolveVst3BundlePath() automatically walks up to the .vst3 bundle root!
+    fileChooser = std::make_unique<juce::FileChooser> ("Select 64-bit VST3 Plugin (.vst3)",
                                                         defaultVst3Dir,
                                                         "*.vst3");
-    auto vstChooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::canSelectDirectories;
-    fileChooser->launchAsync (vstChooserFlags, [this] (const juce::FileChooser& fc)
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
     {
         auto file = fc.getResult();
         if (file.exists())
-        {
-            juce::String err;
-            if (audio.loadVst3Plugin (file, err))
-            {
-                vst3Toggle.setToggleState (true, juce::sendNotification);
-                vst3PluginNameLabel.setText (audio.vst3PluginName, juce::dontSendNotification);
-            }
-            else
-            {
-                juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                         "VST3 Plugin Load Error",
-                                                         err, "OK", this);
-            }
-        }
+            loadVst3FromFile (file);
+        else
+            refreshVst3PluginList (audio.vst3PluginPath);
     });
 }
 
@@ -919,9 +1063,16 @@ void MainPanel::openVst3EditorWindow()
     if (! audio.isVst3PluginLoaded())
     {
         juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                 "No VST3 Plugin Loaded",
-                                                 "Please click 'LOAD VST3...' to load an external plugin first.",
-                                                 "OK", this);
+                                                "No VST3 Plugin Loaded",
+                                                "Please select a VST3 plugin from the dropdown first.",
+                                                "OK", this);
+        return;
+    }
+
+    if (vst3Window != nullptr)
+    {
+        vst3Window->setVisible (true);
+        vst3Window->toFront (true);
         return;
     }
 
@@ -934,20 +1085,19 @@ void MainPanel::openVst3EditorWindow()
     else
     {
         juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon,
-                                                 "No Graphical Interface",
-                                                 "The loaded plugin does not provide a custom GUI editor.",
-                                                 "OK", this);
+                                                "No Graphical Interface",
+                                                "The loaded plugin does not provide a custom GUI editor.",
+                                                "OK", this);
     }
 }
 
 void MainPanel::unloadVst3Plugin()
 {
-    if (vst3Window != nullptr)
-        vst3Window.reset();
-
+    vst3Window.reset();
     audio.unloadVst3Plugin();
     vst3Toggle.setToggleState (false, juce::sendNotification);
     vst3PluginNameLabel.setText ("No VST3 Plugin Loaded", juce::dontSendNotification);
+    vst3PluginSelector.setSelectedId (1, juce::dontSendNotification);
 }
 
 void MainPanel::refreshNamModelList (const juce::String& modelPathToSelect)
@@ -956,22 +1106,13 @@ void MainPanel::refreshNamModelList (const juce::String& modelPathToSelect)
     namModelSelector.clear (juce::dontSendNotification);
 
     std::vector<juce::File> searchDirs;
+    searchDirs.push_back (PresetManager::getModelsFolder());
 
-    // AppData/Roaming/ToneForge/Models
-    auto appDataModels = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Models");
-    if (! appDataModels.exists())
-        appDataModels.createDirectory();
-    searchDirs.push_back (appDataModels);
-
-    // Documents/NAM Models & Documents/NeuralAmpModeler
     auto userDocs = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory);
     searchDirs.push_back (userDocs.getChildFile ("NAM Models"));
     searchDirs.push_back (userDocs.getChildFile ("NeuralAmpModeler"));
     searchDirs.push_back (userDocs.getChildFile ("Neural Amp Modeler"));
 
-    // User Downloads
     auto downloads = juce::File::getSpecialLocation (juce::File::userHomeDirectory).getChildFile ("Downloads");
     if (downloads.isDirectory())
         searchDirs.push_back (downloads);
@@ -986,19 +1127,13 @@ void MainPanel::refreshNamModelList (const juce::String& modelPathToSelect)
             for (const auto& f : files)
             {
                 auto path = f.getFullPathName();
-                if (seenPaths.find (path) == seenPaths.end())
-                {
-                    seenPaths.insert (path);
-                    DiscoveredNamModel item;
-                    item.name = f.getFileNameWithoutExtension();
-                    item.file = f;
-                    discoveredNamModels.push_back (item);
-                }
+                if (seenPaths.insert (path.toLowerCase()).second)
+                    discoveredNamModels.push_back ({ f.getFileNameWithoutExtension(), f });
             }
         }
     }
 
-    std::sort (discoveredNamModels.begin(), discoveredNamModels.end(), [] (const DiscoveredNamModel& a, const DiscoveredNamModel& b)
+    std::sort (discoveredNamModels.begin(), discoveredNamModels.end(), [] (const DiscoveredFile& a, const DiscoveredFile& b)
     {
         return a.name.compareIgnoreCase (b.name) < 0;
     });
@@ -1017,19 +1152,12 @@ void MainPanel::refreshNamModelList (const juce::String& modelPathToSelect)
 
     namModelSelector.addSeparator();
     namModelSelector.addItem ("Browse for File...", static_cast<int> (discoveredNamModels.size() + 2));
-
     namModelSelector.setSelectedId (selectedId, juce::dontSendNotification);
 }
 
 void MainPanel::openModelsFolder()
 {
-    auto appDataModels = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Models");
-    if (! appDataModels.exists())
-        appDataModels.createDirectory();
-
-    appDataModels.revealToUser();
+    PresetManager::getModelsFolder().revealToUser();
 }
 
 void MainPanel::openToneHuntWebsite()
@@ -1039,17 +1167,12 @@ void MainPanel::openToneHuntWebsite()
 
 void MainPanel::browseNamModel()
 {
-    auto userModelFolder = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                .getChildFile ("ToneForge")
-                                .getChildFile ("Models");
-    if (! userModelFolder.exists())
-        userModelFolder.createDirectory();
-
+    auto userModelFolder = PresetManager::getModelsFolder();
     fileChooser = std::make_unique<juce::FileChooser> ("Select Neural Amp Modeler File (.nam, .json)",
-                                                        userModelFolder.exists() ? userModelFolder : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+                                                        userModelFolder.isDirectory() ? userModelFolder : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
                                                         "*.nam;*.json");
-    auto chooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
-    fileChooser->launchAsync (chooserFlags, [this] (const juce::FileChooser& fc)
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc)
     {
         auto file = fc.getResult();
         if (file.existsAsFile())
@@ -1064,8 +1187,8 @@ void MainPanel::browseNamModel()
             else
             {
                 juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                         "NAM Model Load Error",
-                                                         err, "OK", this);
+                                                        "NAM Model Load Error",
+                                                        err, "OK", this);
             }
         }
     });
@@ -1087,17 +1210,17 @@ void MainPanel::updateTelemetryString()
         juce::String devName = currentDevice->getName();
         int rate = static_cast<int> (currentDevice->getCurrentSampleRate());
         int bufSize = currentDevice->getCurrentBufferSizeSamples();
-        float latencyMs = (static_cast<float> (bufSize) / static_cast<float> (rate)) * 1000.0f;
+        float latencyMs = rate > 0 ? (static_cast<float> (bufSize) / static_cast<float> (rate)) * 1000.0f : 0.0f;
 
-        hardwareStatusLabel.setText (typeName + ": " + devName + "  •  " +
-                                     juce::String (rate) + " Hz  •  " +
+        hardwareStatusLabel.setText (typeName + ": " + devName + "  |  " +
+                                     juce::String (rate) + " Hz  |  " +
                                      juce::String (bufSize) + " spls (" +
-                                     juce::String (latencyMs, 1) + " ms latency)",
+                                     juce::String (latencyMs, 1) + " ms)",
                                      juce::dontSendNotification);
     }
     else
     {
-        hardwareStatusLabel.setText ("No Audio Device Selected • Click AUDIO SETUP", juce::dontSendNotification);
+        hardwareStatusLabel.setText ("No Audio Device Selected  |  Click AUDIO SETUP", juce::dontSendNotification);
     }
 }
 
@@ -1127,8 +1250,12 @@ void MainPanel::timerCallback()
         visualCents = 0.0f;
     }
 
-    // Telemetry updates
-    updateTelemetryString();
+    // Update device telemetry roughly once per second
+    if (++telemetryTickCounter >= 30)
+    {
+        telemetryTickCounter = 0;
+        updateTelemetryString();
+    }
 
     // Input & Output Meters
     float inRms = audio.inputRms.load();
@@ -1147,7 +1274,6 @@ void MainPanel::timerCallback()
 
 void MainPanel::paint (juce::Graphics& g)
 {
-    // Deep studio dark background (#191A1C)
     g.fillAll (juce::Colour (0xff191a1c));
 
     // 1. Header background
@@ -1169,7 +1295,7 @@ void MainPanel::paint (juce::Graphics& g)
     g.drawHorizontalLine (getHeight() - footerHeight, 0.0f, static_cast<float> (getWidth()));
 
     // 3. Tuner HUD Box in Header
-    if (!tunerBoxBounds.isEmpty())
+    if (! tunerBoxBounds.isEmpty())
     {
         g.setColour (juce::Colour (0xff141518));
         g.fillRoundedRectangle (tunerBoxBounds.toFloat(), 5.0f);
@@ -1178,8 +1304,7 @@ void MainPanel::paint (juce::Graphics& g)
         g.setColour (inTune ? juce::Colour (0xff38b000) : juce::Colour (0xff333742));
         g.drawRoundedRectangle (tunerBoxBounds.toFloat(), 5.0f, 1.2f);
 
-        // Needle meter bar at bottom of tuner box
-        auto needleArea = tunerBoxBounds.reduced (10, 0).removeFromBottom (12).withTrimmedBottom (3);
+        auto needleArea = tunerBoxBounds.reduced (10, 0).removeFromBottom (11).withTrimmedBottom (3);
         g.setColour (juce::Colour (0xff22252d));
         g.fillRoundedRectangle (needleArea.toFloat(), 3.0f);
 
@@ -1190,11 +1315,11 @@ void MainPanel::paint (juce::Graphics& g)
         if (std::abs (visualCents) > 0.1f)
         {
             float maxOffset = static_cast<float> (needleArea.getWidth()) * 0.46f;
-            float offset = (visualCents / 50.0f) * maxOffset;
-            offset = juce::jlimit (-maxOffset, maxOffset, offset);
+            float offset = juce::jlimit (-maxOffset, maxOffset, (visualCents / 50.0f) * maxOffset);
 
             g.setColour (std::abs (visualCents) <= 3.0f ? juce::Colour (0xff38b000) : juce::Colour (0xff0ba4f0));
-            g.fillRoundedRectangle (centreX + offset - 2.5f, static_cast<float> (needleArea.getY()) + 1.0f, 5.0f, static_cast<float> (needleArea.getHeight()) - 2.0f, 1.5f);
+            g.fillRoundedRectangle (centreX + offset - 2.5f, static_cast<float> (needleArea.getY()) + 1.0f,
+                                    5.0f, static_cast<float> (needleArea.getHeight()) - 2.0f, 1.5f);
         }
     }
 
@@ -1205,12 +1330,12 @@ void MainPanel::paint (juce::Graphics& g)
     drawModuleCard (g, ampCardBounds, ampToggle.getToggleState());
     drawModuleCard (g, cabCardBounds, cabToggle.getToggleState());
     drawModuleCard (g, namCardBounds, namToggle.getToggleState(), juce::Colour (0xff0ba4f0));
-    drawModuleCard (g, vst3CardBounds, vst3Toggle.getToggleState());
+    drawModuleCard (g, vst3CardBounds, vst3Toggle.getToggleState(), juce::Colour (0xff0ba4f0));
     drawModuleCard (g, delayCardBounds, delayToggle.getToggleState());
     drawModuleCard (g, reverbCardBounds, reverbToggle.getToggleState());
 
     // Noise gate active clamping LED
-    if (audio.gateClamping.load() && !gateCardBounds.isEmpty())
+    if (audio.gateClamping.load() && ! gateCardBounds.isEmpty())
     {
         float ledX = static_cast<float> (gateCardBounds.getX()) + 138.0f;
         float ledY = static_cast<float> (gateCardBounds.getY()) + 9.0f;
@@ -1228,60 +1353,60 @@ void MainPanel::resized()
     // 1. Header layout (64px)
     auto header = area.removeFromTop (64).reduced (12, 6);
 
-    // Tuner in exact centre of header
-    const int tunerWidth = 206;
+    // Tuner in centre of header
+    const int tunerWidth = 260;
     const int tunerHeight = 50;
     tunerBoxBounds = juce::Rectangle<int> ((getWidth() - tunerWidth) / 2,
                                            header.getY() + (header.getHeight() - tunerHeight) / 2,
                                            tunerWidth, tunerHeight);
 
-    // Tuner HUD internal layout
-    auto tb = tunerBoxBounds;
+    auto tb = tunerBoxBounds.withTrimmedBottom (11);
     tunerNoteLabel.setBounds (tb.removeFromLeft (52));
+    tunerMuteButton.setBounds (tb.removeFromRight (88).reduced (2, 8));
     tb.removeFromTop (2);
     tunerCentsLabel.setBounds (tb.removeFromTop (16));
     tunerFreqLabel.setBounds (tb.removeFromTop (14));
 
     // Left side of header (Logo & Presets)
     auto leftArea = header.withRight (tunerBoxBounds.getX() - 8);
-    appTitle.setBounds (leftArea.removeFromLeft (juce::jmin (130, leftArea.getWidth())));
-    leftArea.removeFromLeft (8);
+    appTitle.setBounds (leftArea.removeFromLeft (juce::jmin (122, leftArea.getWidth())));
+    leftArea.removeFromLeft (6);
     presetLabel.setBounds (leftArea.removeFromLeft (juce::jmin (50, leftArea.getWidth())));
     leftArea.removeFromLeft (4);
-    savePresetButton.setBounds (leftArea.removeFromRight (juce::jmin (52, leftArea.getWidth())));
+    savePresetButton.setBounds (leftArea.removeFromRight (juce::jmin (50, leftArea.getWidth())).reduced (0, 10));
     leftArea.removeFromRight (6);
-    presetSelector.setBounds (leftArea);
+    presetSelector.setBounds (leftArea.reduced (0, 10));
 
     // Right side of header (Input & Audio Controls)
     auto rightArea = header.withLeft (tunerBoxBounds.getRight() + 8);
-    masterMuteButton.setBounds (rightArea.removeFromRight (juce::jmin (68, rightArea.getWidth())));
-    rightArea.removeFromRight (8);
-    audioSettingsButton.setBounds (rightArea.removeFromRight (juce::jmin (102, rightArea.getWidth())));
-    rightArea.removeFromRight (8);
-    inputSourceLabel.setBounds (rightArea.removeFromLeft (juce::jmin (46, rightArea.getWidth())));
+    masterMuteButton.setBounds (rightArea.removeFromRight (juce::jmin (66, rightArea.getWidth())).reduced (0, 10));
+    rightArea.removeFromRight (6);
+    audioSettingsButton.setBounds (rightArea.removeFromRight (juce::jmin (98, rightArea.getWidth())).reduced (0, 10));
+    rightArea.removeFromRight (6);
+    inputSourceLabel.setBounds (rightArea.removeFromLeft (juce::jmin (44, rightArea.getWidth())));
     rightArea.removeFromLeft (4);
-    inputSourceSelector.setBounds (rightArea);
+    inputSourceSelector.setBounds (rightArea.reduced (0, 10));
 
     // 2. Footer layout (46px)
     auto footer = area.removeFromBottom (46).reduced (14, 2);
     layoutKnob (footer.removeFromLeft (64), inputTrimSlider);
     footer.removeFromLeft (6);
-    inputMeterLabel.setBounds (footer.removeFromLeft (95));
+    inputMeterLabel.setBounds (footer.removeFromLeft (105));
 
     layoutKnob (footer.removeFromRight (68), outputSlider);
     footer.removeFromRight (6);
-    outputMeterLabel.setBounds (footer.removeFromRight (90));
+    outputMeterLabel.setBounds (footer.removeFromRight (95));
 
     hardwareStatusLabel.setBounds (footer);
 
-    // 3. Main Studio Rack Area (4 equal rows)
+    // 3. Main Studio Rack Area (4 rows)
     auto rack = area.reduced (12, 6);
     const int totalHeight = rack.getHeight();
 
-    // Row 1: Dynamics & Distortion Pedals (Noise Gate, Compressor, Overdrive) - 25% height
+    // Row 1: Noise Gate, Compressor, Overdrive (25%)
     int row1Height = (totalHeight * 25) / 100;
     auto row1 = rack.removeFromTop (row1Height);
-    rack.removeFromTop (6); // gap between rows
+    rack.removeFromTop (6);
 
     int col1Width = (row1.getWidth() - 16) / 3;
     gateCardBounds = row1.removeFromLeft (col1Width);
@@ -1318,9 +1443,9 @@ void MainPanel::resized()
     {
         auto card = odCardBounds;
         auto headerBar = card.removeFromTop (28).reduced (8, 2);
-        driveToggle.setBounds (headerBar.removeFromLeft (102));
+        driveToggle.setBounds (headerBar.removeFromLeft (100));
         headerBar.removeFromLeft (4);
-        loadPedalButton.setBounds (headerBar.removeFromRight (90));
+        loadPedalButton.setBounds (headerBar.removeFromRight (86));
         headerBar.removeFromRight (4);
         driveVoicingSelector.setBounds (headerBar);
 
@@ -1331,12 +1456,12 @@ void MainPanel::resized()
         layoutKnob (knobsArea, driveLevelSlider);
     }
 
-    // Row 2: Tube Amp Head & Cabinet IR - 25% height
+    // Row 2: Tube Amp Head & Cabinet IR (25%)
     int row2Height = (totalHeight * 25) / 100;
     auto row2 = rack.removeFromTop (row2Height);
-    rack.removeFromTop (6); // gap between rows
+    rack.removeFromTop (6);
 
-    int ampWidth = ((row2.getWidth() - 8) * 68) / 100;
+    int ampWidth = ((row2.getWidth() - 8) * 65) / 100;
     ampCardBounds = row2.removeFromLeft (ampWidth);
     row2.removeFromLeft (8);
     cabCardBounds = row2;
@@ -1347,7 +1472,7 @@ void MainPanel::resized()
         auto headerBar = card.removeFromTop (28).reduced (8, 2);
         ampToggle.setBounds (headerBar.removeFromLeft (145));
         headerBar.removeFromLeft (6);
-        ampVoicingSelector.setBounds (headerBar.removeFromLeft (juce::jmin (175, headerBar.getWidth())));
+        ampVoicingSelector.setBounds (headerBar.removeFromLeft (juce::jmin (185, headerBar.getWidth())));
 
         auto knobsArea = card.reduced (6, 3);
         int kw = knobsArea.getWidth() / 6;
@@ -1363,20 +1488,21 @@ void MainPanel::resized()
     {
         auto card = cabCardBounds;
         auto headerBar = card.removeFromTop (28).reduced (8, 2);
-        cabToggle.setBounds (headerBar);
+        cabToggle.setBounds (headerBar.removeFromLeft (130));
+        loadIrButton.setBounds (headerBar.removeFromRight (82));
 
-        auto body = card.reduced (10, 3);
-        cabModelSelector.setBounds (body.removeFromTop (23));
+        auto body = card.reduced (8, 4);
+        cabModelSelector.setBounds (body.removeFromTop (24));
+        body.removeFromTop (4);
+        cabIrSelector.setBounds (body.removeFromTop (24));
         body.removeFromTop (3);
-        loadIrButton.setBounds (body.removeFromTop (23));
-        body.removeFromTop (2);
         irFileNameLabel.setBounds (body.removeFromTop (16));
     }
 
-    // Row 3: Neural Amp Modeler (NAM) & External VST3 Plugin - 25% height
+    // Row 3: Neural Amp Modeler (NAM) & External VST3 Plugin (25%)
     int row3Height = (totalHeight * 25) / 100;
     auto row3 = rack.removeFromTop (row3Height);
-    rack.removeFromTop (6); // gap between rows
+    rack.removeFromTop (6);
 
     int col3Width = (row3.getWidth() - 8) / 2;
     namCardBounds = row3.removeFromLeft (col3Width);
@@ -1394,7 +1520,7 @@ void MainPanel::resized()
         openModelsFolderButton.setBounds (headerBar.removeFromRight (92));
 
         auto body = card.reduced (8, 3);
-        auto knobsRight = body.removeFromRight (120);
+        auto knobsRight = body.removeFromRight (126);
         int kw = knobsRight.getWidth() / 2;
         layoutKnob (knobsRight.removeFromLeft (kw), namInputGainSlider);
         layoutKnob (knobsRight, namOutputGainSlider);
@@ -1405,7 +1531,7 @@ void MainPanel::resized()
         topRow.removeFromRight (4);
         namModelSelector.setBounds (topRow);
 
-        body.removeFromTop (4);
+        body.removeFromTop (6);
         namModelNameLabel.setBounds (body.removeFromTop (20));
     }
 
@@ -1413,22 +1539,24 @@ void MainPanel::resized()
     {
         auto card = vst3CardBounds;
         auto headerBar = card.removeFromTop (28).reduced (8, 2);
-        vst3Toggle.setBounds (headerBar);
+        vst3Toggle.setBounds (headerBar.removeFromLeft (190));
+        vst3PositionSelector.setBounds (headerBar.removeFromRight (96));
 
-        auto body = card.reduced (8, 3);
-        auto topBtns = body.removeFromTop (24);
-        int btnW = (topBtns.getWidth() - 8) / 3;
-        loadVst3Button.setBounds (topBtns.removeFromLeft (btnW));
-        topBtns.removeFromLeft (4);
-        openVst3UiButton.setBounds (topBtns.removeFromLeft (btnW));
-        topBtns.removeFromLeft (4);
-        unloadVst3Button.setBounds (topBtns);
+        auto body = card.reduced (8, 4);
+        auto topRow = body.removeFromTop (24);
+        unloadVst3Button.setBounds (topRow.removeFromRight (62));
+        topRow.removeFromRight (4);
+        rescanVst3Button.setBounds (topRow.removeFromRight (62));
+        topRow.removeFromRight (4);
+        openVst3UiButton.setBounds (topRow.removeFromRight (68));
+        topRow.removeFromRight (4);
+        vst3PluginSelector.setBounds (topRow);
 
-        body.removeFromTop (4);
+        body.removeFromTop (6);
         vst3PluginNameLabel.setBounds (body.removeFromTop (20));
     }
 
-    // Row 4: Stereo Delay & Lush Reverb - Remaining height
+    // Row 4: Stereo Delay & Lush Reverb (remaining height)
     auto row4 = rack;
     int col4Width = (row4.getWidth() - 8) / 2;
     delayCardBounds = row4.removeFromLeft (col4Width);
@@ -1455,9 +1583,11 @@ void MainPanel::resized()
         auto headerBar = card.removeFromTop (28).reduced (8, 2);
         reverbToggle.setBounds (headerBar.removeFromLeft (116));
         headerBar.removeFromLeft (4);
-        reverbFileNameLabel.setBounds (headerBar.removeFromRight (110));
+        clearReverbIrButton.setBounds (headerBar.removeFromRight (52));
         headerBar.removeFromRight (4);
-        loadReverbIrButton.setBounds (headerBar);
+        loadReverbIrButton.setBounds (headerBar.removeFromRight (102));
+        headerBar.removeFromRight (6);
+        reverbFileNameLabel.setBounds (headerBar);
 
         auto knobsArea = card.reduced (6, 3);
         int kw = knobsArea.getWidth() / 3;

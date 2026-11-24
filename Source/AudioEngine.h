@@ -13,7 +13,7 @@
 
 enum class GuitarInputRouting
 {
-    AutoDetect = 0, // Auto-route to whichever input has active signal!
+    AutoDetect = 0, // Auto-route to whichever input has active signal
     GuitarCh2 = 1,  // Focusrite Solo Inst In (Channel 2)
     MicCh1 = 2,     // Focusrite Solo Mic In (Channel 1)
     StereoSum = 3   // Sum both channels
@@ -35,6 +35,12 @@ enum class DriveVoicing
     PrecisionDrive = 4,       // Horizon Precision Drive (Modern Djent Attack)
     BigMuffFuzz = 5,          // EHX Big Muff Pi (Wall of Fuzz)
     CustomImported = 6        // User-Imported Pedal (.tfpedal, .xml, .wav, .nam)
+};
+
+enum class Vst3SlotPosition
+{
+    PreAmp = 0,  // Before Overdrive / Amp / NAM (ideal for gates, OD pedals, compressors, amp suites)
+    PostCab = 1  // After Cabinet / NAM, before Delay & Reverb (ideal for EQ, compressors, amp suites, FX)
 };
 
 struct CustomPedalModel
@@ -74,39 +80,72 @@ public:
 
     void audioDeviceAboutToStart (juce::AudioIODevice* device) override
     {
-        sampleRate = device != nullptr ? device->getCurrentSampleRate() : 48000.0;
+        sampleRate = (device != nullptr && device->getCurrentSampleRate() > 0.0)
+                         ? device->getCurrentSampleRate()
+                         : 48000.0;
+        maxBlockSize = juce::jmax (2048, device != nullptr ? device->getCurrentBufferSizeSamples() : 2048);
+
         tuner.setSampleRate (sampleRate);
 
         delayBufferL.assign (static_cast<size_t> (sampleRate * 2.5) + 1, 0.0f);
         delayBufferR.assign (static_cast<size_t> (sampleRate * 2.5) + 1, 0.0f);
         delayWrite = 0;
 
+        tempInput.assign (static_cast<size_t> (maxBlockSize), 0.0f);
+        tempLeft.assign (static_cast<size_t> (maxBlockSize), 0.0f);
+        tempRight.assign (static_cast<size_t> (maxBlockSize), 0.0f);
+        reverbWetL.assign (static_cast<size_t> (maxBlockSize), 0.0f);
+        reverbWetR.assign (static_cast<size_t> (maxBlockSize), 0.0f);
+
         resetDsp();
 
         juce::dsp::ProcessSpec spec;
         spec.sampleRate = sampleRate;
-        spec.maximumBlockSize = 2048;
+        spec.maximumBlockSize = static_cast<juce::uint32> (maxBlockSize);
         spec.numChannels = 2;
-        convolution.prepare (spec);
 
-        // Prepare 4x Oversampling Engine (2^2 = 4x) for distortion & tube saturation
+        cabConvolution.prepare (spec);
+        reverbConvolution.prepare (spec);
+        studioReverb.prepare (spec);
+
+        // Prepare 4x Oversampling Engine (2^2 = 4x) for overdrive & tube amp saturation
         oversampling = std::make_unique<juce::dsp::Oversampling<float>> (
             1, // mono processing before stereo spatial stage
             2, // 4x oversampling factor
             juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR,
             true
         );
-        oversampling->initProcessing (static_cast<size_t> (spec.maximumBlockSize));
+        oversampling->initProcessing (static_cast<size_t> (maxBlockSize));
         oversampling->reset();
 
-        // Initialize EQ and Cabinet Filters
-        updateToneStackFilters();
-        updateCabFilters();
+        // Force initial filter coefficient calculation
+        lastToneRate = -1.0;
+        lastCabRate = -1.0;
+        updateToneStackFiltersIfNeeded();
+        updateCabFiltersIfNeeded();
 
-        const juce::ScopedLock sl (pluginLock);
-        if (vst3PluginInstance != nullptr)
+        // Re-prepare NAM model for new sample rate / block size
         {
-            vst3PluginInstance->prepareToPlay (sampleRate, 2048);
+            const juce::ScopedLock sl (namLock);
+            if (namModel != nullptr)
+                namModel->Reset (sampleRate, maxBlockSize);
+        }
+
+        // Re-prepare VST3 plugin for new sample rate / block size
+        {
+            const juce::ScopedLock sl (pluginLock);
+            if (vst3PluginInstance != nullptr)
+            {
+                vst3PluginInstance->prepareToPlay (sampleRate, maxBlockSize);
+                int numChans = juce::jmax (2,
+                                           vst3PluginInstance->getTotalNumInputChannels(),
+                                           vst3PluginInstance->getTotalNumOutputChannels());
+                vst3Buffer.setSize (numChans, maxBlockSize, false, true, false);
+            }
+            else
+            {
+                vst3Buffer.setSize (2, maxBlockSize, false, true, false);
+            }
         }
     }
 
@@ -115,7 +154,9 @@ public:
         delayBufferL.clear();
         delayBufferR.clear();
         delayWrite = 0;
-        convolution.reset();
+        cabConvolution.reset();
+        reverbConvolution.reset();
+        studioReverb.reset();
         if (oversampling != nullptr)
             oversampling->reset();
 
@@ -124,14 +165,29 @@ public:
             vst3PluginInstance->releaseResources();
     }
 
-    void updateToneStackFilters()
+    void updateToneStackFiltersIfNeeded()
     {
         const float bVal = ampBass.load();
         const float mVal = ampMiddle.load();
         const float tVal = ampTreble.load();
         const float pVal = ampPresence.load();
 
-        // Bass: Low Shelf @ 90 Hz (-24 dB to +12 dB range). Turning Bass to 0 cuts -24 dB completely killing mud!
+        if (lastToneRate == sampleRate
+            && bVal == lastToneBass
+            && mVal == lastToneMid
+            && tVal == lastToneTreble
+            && pVal == lastTonePresence)
+        {
+            return;
+        }
+
+        lastToneRate = sampleRate;
+        lastToneBass = bVal;
+        lastToneMid = mVal;
+        lastToneTreble = tVal;
+        lastTonePresence = pVal;
+
+        // Bass: Low Shelf @ 90 Hz (-24 dB to +12 dB range)
         float bassGainDb = (bVal - 0.5f) * 36.0f - 6.0f;
         bassFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
             sampleRate, 90.0f, 0.707f, juce::Decibels::decibelsToGain (bassGainDb));
@@ -152,26 +208,30 @@ public:
             sampleRate, 5500.0f, 0.707f, juce::Decibels::decibelsToGain (presGainDb));
     }
 
-    void updateCabFilters()
+    void updateCabFiltersIfNeeded()
     {
-        const auto cabMode = static_cast<CabType> (cabModel.load());
+        const int modeInt = cabModel.load();
+        if (lastCabRate == sampleRate && lastCabModel == modeInt)
+            return;
+
+        lastCabRate = sampleRate;
+        lastCabModel = modeInt;
+
+        const auto cabMode = static_cast<CabType> (modeInt);
         if (cabMode == CabType::Vintage30_4x12)
         {
-            // V30: HighPass 85Hz, LowPass 4.2kHz, Mid notch @ 1.2kHz
             cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 85.0f, 0.707f);
             cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 4200.0f, 0.85f);
             cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 1200.0f, 1.2f, 0.65f);
         }
         else if (cabMode == CabType::Greenback_2x12)
         {
-            // Greenback: HighPass 95Hz, LowPass 3.8kHz, Mid warm boost @ 450Hz
             cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 95.0f, 0.707f);
             cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 3800.0f, 0.75f);
             cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 450.0f, 1.0f, 1.25f);
         }
-        else // American 1x12
+        else // American 1x12 (also fallback if CustomIR selected with no file loaded)
         {
-            // American: HighPass 75Hz, LowPass 5.2kHz, Mid scoop @ 600Hz
             cabHpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 75.0f, 0.707f);
             cabLpFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 5200.0f, 0.707f);
             cabNotchFilter.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (sampleRate, 600.0f, 0.9f, 0.70f);
@@ -187,6 +247,16 @@ public:
     {
         if (numSamples <= 0)
             return;
+
+        // Guard against unexpected oversized buffers
+        if (static_cast<size_t> (numSamples) > tempInput.size())
+        {
+            tempInput.resize (static_cast<size_t> (numSamples), 0.0f);
+            tempLeft.resize (static_cast<size_t> (numSamples), 0.0f);
+            tempRight.resize (static_cast<size_t> (numSamples), 0.0f);
+            reverbWetL.resize (static_cast<size_t> (numSamples), 0.0f);
+            reverbWetR.resize (static_cast<size_t> (numSamples), 0.0f);
+        }
 
         const float* inCh1 = (numInputs > 0 && inputs != nullptr) ? inputs[0] : nullptr;
         const float* inCh2 = (numInputs > 1 && inputs != nullptr) ? inputs[1] : nullptr;
@@ -235,7 +305,6 @@ public:
         const float inTrimGain = juce::Decibels::decibelsToGain (inputTrimDb.load());
         const bool isMuted = masterMute.load();
 
-        tempInput.resize (static_cast<size_t> (numSamples));
         float sumSquaresIn = 0.0f;
 
         for (int i = 0; i < numSamples; ++i)
@@ -276,7 +345,7 @@ public:
             return;
         }
 
-        // DSP Parameters
+        // Snapshot DSP Parameters
         const bool gateOn = gateEnabled.load();
         const float gateThresh = juce::Decibels::decibelsToGain (gateThresholdDb.load());
         const float gateRelease = gateReleaseMs.load();
@@ -299,6 +368,9 @@ public:
         const bool cabOn = cabinetEnabled.load();
         const auto cabMode = static_cast<CabType> (cabModel.load());
 
+        const bool vst3On = vst3Enabled.load();
+        const auto vst3Pos = static_cast<Vst3SlotPosition> (vst3Position.load());
+
         const bool delOn = delayEnabled.load();
         const float delMix = delayMix.load();
         const float delTime = delayTimeMs.load() / 1000.0f;
@@ -312,18 +384,14 @@ public:
 
         const float outGain = juce::Decibels::decibelsToGain (outputDb.load());
 
-        // Update EQ & Cab filters
-        updateToneStackFilters();
-        updateCabFilters();
+        // Update EQ & Cab filters ONLY when parameters actually changed (no per-block heap alloc)
+        updateToneStackFiltersIfNeeded();
+        updateCabFiltersIfNeeded();
 
         const auto delaySamples = juce::jlimit<size_t> (1, delayBufferL.empty() ? 1 : delayBufferL.size() - 1,
             static_cast<size_t> (juce::jmax (1.0, sampleRate * delTime)));
 
-        float sumSquaresOut = 0.0f;
         bool isGatingNow = false;
-
-        tempLeft.resize (static_cast<size_t> (numSamples));
-        tempRight.resize (static_cast<size_t> (numSamples));
 
         // --- STAGE 1: GATE + COMPRESSOR ---
         for (int i = 0; i < numSamples; ++i)
@@ -361,9 +429,16 @@ public:
             }
 
             tempLeft[static_cast<size_t> (i)] = x;
+            tempRight[static_cast<size_t> (i)] = x;
         }
 
         gateClamping.store (isGatingNow);
+
+        // --- OPTIONAL PRE-AMP VST3 SLOT ---
+        if (vst3On && vst3Pos == Vst3SlotPosition::PreAmp && hasVst3Loaded.load())
+        {
+            processVst3Slot (numSamples);
+        }
 
         // --- STAGE 2: PRE-GAIN HIGH-PASS TIGHTENER + OVERDRIVE + TUBE AMP SATURATION (4x OVERSAMPLED) ---
         if (odOn || ampOn)
@@ -378,120 +453,140 @@ public:
                 else if (odMode == DriveVoicing::PrecisionDrive) preCutFreq = 750.0f;
                 else if (odMode == DriveVoicing::HeavyMetalChainsaw) preCutFreq = 450.0f;
                 else if (odMode == DriveVoicing::RodentDistortion) preCutFreq = 350.0f;
+                else if (odMode == DriveVoicing::CustomImported && customPedal.isLoaded) preCutFreq = customPedal.preFilterFreq;
             }
 
-            float preCutCoeff = std::exp (-2.0f * 3.14159265f * preCutFreq / static_cast<float> (sampleRate));
-
-            for (int i = 0; i < numSamples; ++i)
+            auto processNonLinearSamples = [&] (float* data, int count, double procRate)
             {
-                float x = tempLeft[static_cast<size_t> (i)];
+                const float preCutCoeff = std::exp (-2.0f * 3.14159265f * preCutFreq / static_cast<float> (procRate));
 
-                // Pre-gain bass cut (High-Pass Filter)
-                preHpState = preHpState * preCutCoeff + x * (1.0f - preCutCoeff);
-                float tightInput = x - preHpState * 0.92f;
-
-                // 3. OVERDRIVE PEDAL
-                if (odOn)
+                for (int i = 0; i < count; ++i)
                 {
-                    float pedalIn = tightInput;
-                    float driven = 0.0f;
-                    float clipped = 0.0f;
-                    float cleanBlend = 0.0f;
+                    float x = data[i];
 
-                    if (odMode == DriveVoicing::TubeScreamer)
+                    // Pre-gain bass cut (High-Pass Filter)
+                    preHpState = preHpState * preCutCoeff + x * (1.0f - preCutCoeff);
+                    float tightInput = x - preHpState * 0.92f;
+
+                    // 3. OVERDRIVE PEDAL
+                    if (odOn)
                     {
-                        driven = pedalIn * (1.0f + odDrive * 12.0f);
-                        clipped = std::tanh (driven);
-                    }
-                    else if (odMode == DriveVoicing::KlonCentaur)
-                    {
-                        driven = pedalIn * (1.0f + odDrive * 14.0f);
-                        clipped = driven > 0.0f ? std::tanh (driven * 1.25f) * 0.82f : std::tanh (driven * 0.92f);
-                        cleanBlend = juce::jlimit (0.0f, 0.40f, (1.0f - odDrive) * 0.50f);
-                    }
-                    else if (odMode == DriveVoicing::RodentDistortion)
-                    {
-                        driven = pedalIn * (1.0f + odDrive * 32.0f);
-                        clipped = juce::jlimit (-0.78f, 0.78f, driven);
-                    }
-                    else if (odMode == DriveVoicing::HeavyMetalChainsaw)
-                    {
-                        driven = pedalIn * (1.0f + odDrive * 40.0f);
-                        clipped = juce::jlimit (-0.75f, 0.75f, std::tanh (driven * 1.6f));
-                    }
-                    else if (odMode == DriveVoicing::PrecisionDrive)
-                    {
-                        driven = pedalIn * (1.0f + odDrive * 28.0f);
-                        clipped = std::tanh (driven * 1.5f);
-                    }
-                    else if (odMode == DriveVoicing::BigMuffFuzz)
-                    {
-                        driven = pedalIn * (1.0f + odDrive * 50.0f);
-                        clipped = (driven > 0.0f ? 1.0f : -1.0f) * (1.0f - std::exp (-std::abs (driven)));
-                    }
-                    else // Custom Imported Pedal
-                    {
-                        driven = pedalIn * (1.0f + odDrive * customPedal.gainMult);
-                        if (customPedal.clipType == 1)
-                            clipped = juce::jlimit (-0.80f, 0.80f, driven);
-                        else if (customPedal.clipType == 2)
-                            clipped = driven > 0.0f ? std::tanh (driven * 1.25f) * 0.82f : std::tanh (driven * 0.92f);
-                        else if (customPedal.clipType == 3)
-                            clipped = juce::jlimit (-0.75f, 0.75f, std::tanh (driven * 1.5f));
-                        else if (customPedal.clipType == 5)
-                            clipped = (driven > 0.0f ? 1.0f : -1.0f) * (1.0f - std::exp (-std::abs (driven)));
-                        else
+                        float pedalIn = tightInput;
+                        float driven = 0.0f;
+                        float clipped = 0.0f;
+                        float cleanBlend = 0.0f;
+
+                        if (odMode == DriveVoicing::TubeScreamer)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 12.0f);
                             clipped = std::tanh (driven);
+                        }
+                        else if (odMode == DriveVoicing::KlonCentaur)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 14.0f);
+                            clipped = driven > 0.0f ? std::tanh (driven * 1.25f) * 0.82f : std::tanh (driven * 0.92f);
+                            cleanBlend = juce::jlimit (0.0f, 0.40f, (1.0f - odDrive) * 0.50f);
+                        }
+                        else if (odMode == DriveVoicing::RodentDistortion)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 32.0f);
+                            clipped = juce::jlimit (-0.78f, 0.78f, driven);
+                        }
+                        else if (odMode == DriveVoicing::HeavyMetalChainsaw)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 40.0f);
+                            clipped = juce::jlimit (-0.75f, 0.75f, std::tanh (driven * 1.6f));
+                        }
+                        else if (odMode == DriveVoicing::PrecisionDrive)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 28.0f);
+                            clipped = std::tanh (driven * 1.5f);
+                        }
+                        else if (odMode == DriveVoicing::BigMuffFuzz)
+                        {
+                            driven = pedalIn * (1.0f + odDrive * 50.0f);
+                            clipped = (driven > 0.0f ? 1.0f : -1.0f) * (1.0f - std::exp (-std::abs (driven)));
+                        }
+                        else // Custom Imported Pedal
+                        {
+                            driven = pedalIn * (1.0f + odDrive * customPedal.gainMult);
+                            if (customPedal.clipType == 1)
+                                clipped = juce::jlimit (-0.80f, 0.80f, driven);
+                            else if (customPedal.clipType == 2)
+                                clipped = driven > 0.0f ? std::tanh (driven * 1.25f) * 0.82f : std::tanh (driven * 0.92f);
+                            else if (customPedal.clipType == 3)
+                                clipped = juce::jlimit (-0.75f, 0.75f, std::tanh (driven * 1.5f));
+                            else if (customPedal.clipType == 5)
+                                clipped = (driven > 0.0f ? 1.0f : -1.0f) * (1.0f - std::exp (-std::abs (driven)));
+                            else
+                                clipped = std::tanh (driven);
 
-                        cleanBlend = customPedal.cleanBlend;
+                            cleanBlend = customPedal.cleanBlend;
+                        }
+
+                        // Tone shaping post-filter (rate-compensated)
+                        float toneFreq = 800.0f + odTone * 5500.0f;
+                        float toneCoeff = 1.0f - std::exp (-2.0f * 3.14159265f * toneFreq / static_cast<float> (procRate));
+                        odPostFilterState = odPostFilterState + toneCoeff * (clipped - odPostFilterState);
+
+                        float wetSignal = odPostFilterState * (0.75f + odLevel * 0.65f);
+                        tightInput = (pedalIn * cleanBlend) + (wetSignal * (1.0f - cleanBlend));
                     }
 
-                    // Tone shaping post-filter
-                    float toneCoeff = 0.15f + odTone * 0.80f;
-                    odPostFilterState = odPostFilterState * (1.0f - toneCoeff) + clipped * toneCoeff;
-
-                    float wetSignal = odPostFilterState * (0.75f + odLevel * 0.65f);
-                    tightInput = (pedalIn * cleanBlend) + (wetSignal * (1.0f - cleanBlend));
-                }
-
-                // 4. TUBE AMP HEAD STAGE
-                if (ampOn)
-                {
-                    float ampIn = tightInput;
-
-                    if (ampModel == AmpVoicing::Clean)
+                    // 4. TUBE AMP HEAD STAGE
+                    if (ampOn)
                     {
-                        float drive1 = 1.0f + aGain * 6.0f;
-                        float tube1 = triodeStage (ampIn, drive1, 0.08f);
-                        x = tube1 * (aMaster * 1.4f);
+                        float ampIn = tightInput;
+
+                        if (ampModel == AmpVoicing::Clean)
+                        {
+                            float drive1 = 1.0f + aGain * 6.0f;
+                            float tube1 = triodeStage (ampIn, drive1, 0.08f);
+                            x = tube1 * (aMaster * 1.4f);
+                        }
+                        else if (ampModel == AmpVoicing::Crunch)
+                        {
+                            float drive1 = 1.0f + aGain * 14.0f;
+                            float t1 = triodeStage (ampIn, drive1, 0.12f);
+                            ampStage1State = ampStage1State * 0.60f + t1 * 0.40f;
+                            float t2 = triodeStage (ampStage1State, 2.2f, 0.05f);
+                            x = t2 * (aMaster * 1.3f);
+                        }
+                        else // Lead High Gain 5150 / Rectifier
+                        {
+                            float drive1 = 1.0f + aGain * 32.0f;
+                            float t1 = triodeStage (ampIn, drive1 * 0.5f, 0.15f);
+                            ampStage1State = ampStage1State * 0.50f + t1 * 0.50f;
+
+                            float t2 = triodeStage (ampStage1State, 3.2f, 0.08f);
+                            ampStage2State = ampStage2State * 0.55f + t2 * 0.45f;
+
+                            float t3 = triodeStage (ampStage2State, 2.4f, 0.02f);
+                            x = t3 * (aMaster * 1.25f);
+                        }
                     }
-                    else if (ampModel == AmpVoicing::Crunch)
+                    else
                     {
-                        float drive1 = 1.0f + aGain * 14.0f;
-                        float t1 = triodeStage (ampIn, drive1, 0.12f);
-                        ampStage1State = ampStage1State * 0.60f + t1 * 0.40f;
-                        float t2 = triodeStage (ampStage1State, 2.2f, 0.05f);
-                        x = t2 * (aMaster * 1.3f);
+                        x = tightInput;
                     }
-                    else // Lead High Gain 5150 / Rectifier
-                    {
-                        float drive1 = 1.0f + aGain * 32.0f;
-                        float t1 = triodeStage (ampIn, drive1 * 0.5f, 0.15f);
-                        ampStage1State = ampStage1State * 0.50f + t1 * 0.50f;
 
-                        float t2 = triodeStage (ampStage1State, 3.2f, 0.08f);
-                        ampStage2State = ampStage2State * 0.55f + t2 * 0.45f;
-
-                        float t3 = triodeStage (ampStage2State, 2.4f, 0.02f);
-                        x = t3 * (aMaster * 1.25f);
-                    }
+                    data[i] = x;
                 }
-                else
-                {
-                    x = tightInput;
-                }
+            };
 
-                tempLeft[static_cast<size_t> (i)] = x;
+            if (oversampling != nullptr && numSamples <= maxBlockSize)
+            {
+                float* monoPtr[1] = { tempLeft.data() };
+                juce::dsp::AudioBlock<float> monoBlock (monoPtr, 1, static_cast<size_t> (numSamples));
+                auto osBlock = oversampling->processSamplesUp (monoBlock);
+                processNonLinearSamples (osBlock.getChannelPointer (0),
+                                         static_cast<int> (osBlock.getNumSamples()),
+                                         sampleRate * oversampling->getOversamplingFactor());
+                oversampling->processSamplesDown (monoBlock);
+            }
+            else
+            {
+                processNonLinearSamples (tempLeft.data(), numSamples, sampleRate);
             }
         }
 
@@ -530,6 +625,8 @@ public:
                 for (int i = 0; i < numSamples; ++i)
                 {
                     float s = tempRight[static_cast<size_t> (i)] * namOutGain;
+                    if (! std::isfinite (s))
+                        s = 0.0f;
                     tempLeft[static_cast<size_t> (i)] = s;
                     tempRight[static_cast<size_t> (i)] = s;
                 }
@@ -539,16 +636,14 @@ public:
         // --- STAGE 5: CABINET / SPEAKER SIMULATION ---
         if (cabOn)
         {
-            if (cabMode == CabType::CustomIR && hasCustomIrLoaded)
+            if (cabMode == CabType::CustomIR && hasCustomIrLoaded.load())
             {
-                for (int i = 0; i < numSamples; ++i)
-                    tempRight[static_cast<size_t> (i)] = tempLeft[static_cast<size_t> (i)];
-
+                juce::FloatVectorOperations::copy (tempRight.data(), tempLeft.data(), numSamples);
                 tempPointers[0] = tempLeft.data();
                 tempPointers[1] = tempRight.data();
                 juce::dsp::AudioBlock<float> block (tempPointers, 2, static_cast<size_t> (numSamples));
                 juce::dsp::ProcessContextReplacing<float> context (block);
-                convolution.process (context);
+                cabConvolution.process (context);
             }
             else
             {
@@ -565,84 +660,95 @@ public:
         }
         else
         {
+            juce::FloatVectorOperations::copy (tempRight.data(), tempLeft.data(), numSamples);
+        }
+
+        // --- STAGE 6: POST-CAB EXTERNAL VST3 PLUGIN HOST SLOT ---
+        if (vst3On && vst3Pos == Vst3SlotPosition::PostCab && hasVst3Loaded.load())
+        {
+            processVst3Slot (numSamples);
+        }
+
+        // --- STAGE 7A: STEREO PING-PONG TAPE DELAY ---
+        if (delOn && delMix > 0.001f && ! delayBufferL.empty())
+        {
+            const float damp = 0.30f + delTone * 0.60f;
             for (int i = 0; i < numSamples; ++i)
-                tempRight[static_cast<size_t> (i)] = tempLeft[static_cast<size_t> (i)];
-        }
-
-        // --- STAGE 6: EXTERNAL VST3 PLUGIN HOST SLOT ---
-        const bool vst3On = vst3Enabled.load();
-        if (vst3On && hasVst3Loaded.load())
-        {
-            const juce::ScopedTryLock tryLock (pluginLock);
-            if (tryLock.isLocked() && vst3PluginInstance != nullptr)
             {
-                int numChans = vst3PluginInstance->getTotalNumInputChannels();
-                if (numChans > 0)
-                {
-                    vst3Buffer.setSize (juce::jmax (2, numChans), numSamples, false, false, true);
-                    vst3Buffer.copyFrom (0, 0, tempLeft.data(), numSamples);
-                    if (vst3Buffer.getNumChannels() > 1)
-                        vst3Buffer.copyFrom (1, 0, tempRight.data(), numSamples);
+                float l = tempLeft[static_cast<size_t> (i)];
+                float r = tempRight[static_cast<size_t> (i)];
 
-                    vst3MidiBuffer.clear();
-                    vst3PluginInstance->processBlock (vst3Buffer, vst3MidiBuffer);
-
-                    juce::FloatVectorOperations::copy (tempLeft.data(), vst3Buffer.getReadPointer (0), numSamples);
-                    if (vst3Buffer.getNumChannels() > 1)
-                        juce::FloatVectorOperations::copy (tempRight.data(), vst3Buffer.getReadPointer (1), numSamples);
-                    else
-                        juce::FloatVectorOperations::copy (tempRight.data(), vst3Buffer.getReadPointer (0), numSamples);
-                }
-            }
-        }
-
-        // --- STAGE 7: STEREO TAPE DELAY, LUSH REVERB, & OUTPUT LIMITER ---
-        for (int i = 0; i < numSamples; ++i)
-        {
-            float l = tempLeft[static_cast<size_t> (i)];
-            float r = tempRight[static_cast<size_t> (i)];
-
-            // Ping-Pong Delay
-            if (delOn && delMix > 0.001f && ! delayBufferL.empty())
-            {
                 const size_t readL = (delayWrite + delayBufferL.size() - delaySamples) % delayBufferL.size();
-                const size_t offsetR = static_cast<size_t> (delaySamples * 0.85f);
+                const size_t offsetR = juce::jmax<size_t> (1, static_cast<size_t> (delaySamples * 0.85f));
                 const size_t readR = (delayWrite + delayBufferR.size() - offsetR) % delayBufferR.size();
 
                 float delayedL = delayBufferL[readL];
                 float delayedR = delayBufferR[readR];
 
-                float damp = 0.30f + delTone * 0.60f;
                 delayDampL = delayDampL * (1.0f - damp) + delayedL * damp;
                 delayDampR = delayDampR * (1.0f - damp) + delayedR * damp;
 
                 delayBufferL[delayWrite] = l + delayDampR * delFeedback;
                 delayBufferR[delayWrite] = r + delayDampL * delFeedback;
 
-                l = l * (1.0f - delMix * 0.65f) + delayDampL * delMix;
-                r = r * (1.0f - delMix * 0.65f) + delayDampR * delMix;
+                tempLeft[static_cast<size_t> (i)] = l * (1.0f - delMix * 0.65f) + delayDampL * delMix;
+                tempRight[static_cast<size_t> (i)] = r * (1.0f - delMix * 0.65f) + delayDampR * delMix;
 
                 delayWrite = (delayWrite + 1) % delayBufferL.size();
             }
+        }
 
-            // Lush Reverb
-            if (revOn && revMix > 0.001f)
+        // --- STAGE 7B: STUDIO REVERB (BUILT-IN FREEVERB OR DEDICATED CONVOLUTION IR) ---
+        if (revOn && revMix > 0.001f)
+        {
+            if (hasCustomReverbLoaded.load())
             {
-                revLowpassL = revLowpassL * (0.8f - revDamp * 0.3f) + l * (0.2f + revDamp * 0.3f);
-                revLowpassR = revLowpassR * (0.8f - revDamp * 0.3f) + r * (0.2f + revDamp * 0.3f);
+                juce::FloatVectorOperations::copy (reverbWetL.data(), tempLeft.data(), numSamples);
+                juce::FloatVectorOperations::copy (reverbWetR.data(), tempRight.data(), numSamples);
+                reverbPointers[0] = reverbWetL.data();
+                reverbPointers[1] = reverbWetR.data();
+                juce::dsp::AudioBlock<float> wetBlock (reverbPointers, 2, static_cast<size_t> (numSamples));
+                juce::dsp::ProcessContextReplacing<float> wetCtx (wetBlock);
+                reverbConvolution.process (wetCtx);
 
-                revTailL = revLowpassL * revMix + revTailL * (0.68f + revDecay * 0.28f);
-                revTailR = revLowpassR * revMix + revTailR * (0.70f + revDecay * 0.26f);
-
-                l = l * (1.0f - revMix * 0.4f) + revTailL * revMix * 0.45f;
-                r = r * (1.0f - revMix * 0.4f) + revTailR * revMix * 0.45f;
+                const float dryAmt = 1.0f - revMix * 0.5f;
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    tempLeft[static_cast<size_t> (i)] = tempLeft[static_cast<size_t> (i)] * dryAmt + reverbWetL[static_cast<size_t> (i)] * revMix;
+                    tempRight[static_cast<size_t> (i)] = tempRight[static_cast<size_t> (i)] * dryAmt + reverbWetR[static_cast<size_t> (i)] * revMix;
+                }
             }
+            else
+            {
+                juce::dsp::Reverb::Parameters revParams;
+                revParams.roomSize = 0.15f + revDecay * 0.80f;
+                revParams.damping = revDamp;
+                revParams.wetLevel = revMix;
+                revParams.dryLevel = 1.0f - revMix * 0.35f;
+                revParams.width = 1.0f;
+                revParams.freezeMode = 0.0f;
+                studioReverb.setParameters (revParams);
 
-            l *= outGain;
-            r *= outGain;
+                tempPointers[0] = tempLeft.data();
+                tempPointers[1] = tempRight.data();
+                juce::dsp::AudioBlock<float> revBlock (tempPointers, 2, static_cast<size_t> (numSamples));
+                juce::dsp::ProcessContextReplacing<float> revCtx (revBlock);
+                studioReverb.process (revCtx);
+            }
+        }
 
-            l = softLimit (l);
-            r = softLimit (r);
+        // --- STAGE 8: MASTER OUTPUT GAIN, SANITIZER & SAFETY LIMITER ---
+        float sumSquaresOut = 0.0f;
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float l = tempLeft[static_cast<size_t> (i)];
+            float r = tempRight[static_cast<size_t> (i)];
+
+            if (! std::isfinite (l)) l = 0.0f;
+            if (! std::isfinite (r)) r = 0.0f;
+
+            l = softLimit (l * outGain);
+            r = softLimit (r * outGain);
 
             sumSquaresOut += 0.5f * (l * l + r * r);
 
@@ -654,6 +760,8 @@ public:
 
         outputRms.store (std::sqrt (sumSquaresOut / static_cast<float> (numSamples)));
     }
+
+    // ==================== NAM MODEL MANAGEMENT ====================
 
     bool loadNamModel (const juce::File& file, juce::String& errorMsg)
     {
@@ -673,6 +781,9 @@ public:
                 errorMsg = "Could not parse or initialize NAM model:\n" + file.getFileName();
                 return false;
             }
+
+            // Prepare & prewarm model for current sample rate and block size outside audio thread
+            newModel->Reset (sampleRate, maxBlockSize);
 
             {
                 const juce::ScopedLock sl (namLock);
@@ -712,13 +823,29 @@ public:
         namEnabled.store (false);
     }
 
-    bool isNamModelLoaded() const
+    bool isNamModelLoaded() const { return hasNamLoaded.load(); }
+
+    // ==================== VST3 PLUGIN MANAGEMENT ====================
+
+    static juce::File resolveVst3BundlePath (const juce::File& input)
     {
-        return hasNamLoaded.load();
+        // If user selected the inner .vst3 DLL inside *.vst3/Contents/x86_64-win/, walk up to the .vst3 bundle root
+        auto cur = input;
+        for (int depth = 0; depth < 4 && cur.exists(); ++depth)
+        {
+            if (cur.isDirectory() && cur.hasFileExtension (".vst3"))
+                return cur;
+            auto parent = cur.getParentDirectory();
+            if (parent == cur)
+                break;
+            cur = parent;
+        }
+        return input;
     }
 
-    bool loadVst3Plugin (const juce::File& file, juce::String& errorMsg)
+    bool loadVst3Plugin (const juce::File& rawFile, juce::String& errorMsg)
     {
+        auto file = resolveVst3BundlePath (rawFile);
         if (! file.exists())
         {
             errorMsg = "File does not exist: " + file.getFullPathName();
@@ -726,23 +853,55 @@ public:
         }
 
         juce::OwnedArray<juce::PluginDescription> typesFound;
-        juce::VST3PluginFormat vst3Format;
-        vst3Format.findAllTypesForFile (typesFound, file.getFullPathName());
+        for (auto* format : pluginFormatManager.getFormats())
+        {
+            if (format->getName().equalsIgnoreCase ("VST3"))
+            {
+                format->findAllTypesForFile (typesFound, file.getFullPathName());
+                break;
+            }
+        }
 
         if (typesFound.isEmpty())
         {
-            errorMsg = "No valid VST3 plugin found in file:\n" + file.getFileName();
+            errorMsg = "No valid 64-bit VST3 plugin found in:\n" + file.getFullPathName();
             return false;
         }
 
         juce::String createErr;
-        auto newInstance = pluginFormatManager.createPluginInstance (*typesFound[0], sampleRate, 2048, createErr);
+        auto newInstance = pluginFormatManager.createPluginInstance (*typesFound[0], sampleRate, maxBlockSize, createErr);
 
         if (newInstance == nullptr)
         {
-            errorMsg = "Failed to load VST3 plugin:\n" + createErr;
+            errorMsg = "Failed to instantiate VST3 plugin:\n" + createErr;
             return false;
         }
+
+        // Configure stereo bus layout cleanly (required by many modern VST3s like TONE3000, Gateway, Focusrite Red)
+        newInstance->enableAllBuses();
+        juce::AudioProcessor::BusesLayout stereoLayout;
+        stereoLayout.inputBuses.add (juce::AudioChannelSet::stereo());
+        stereoLayout.outputBuses.add (juce::AudioChannelSet::stereo());
+        if (newInstance->checkBusesLayoutSupported (stereoLayout))
+        {
+            newInstance->setBusesLayout (stereoLayout);
+        }
+        else
+        {
+            // Fallback: mono-in / stereo-out (common for guitar amp sims)
+            juce::AudioProcessor::BusesLayout monoInStereoOut;
+            monoInStereoOut.inputBuses.add (juce::AudioChannelSet::mono());
+            monoInStereoOut.outputBuses.add (juce::AudioChannelSet::stereo());
+            if (newInstance->checkBusesLayoutSupported (monoInStereoOut))
+                newInstance->setBusesLayout (monoInStereoOut);
+        }
+
+        newInstance->setRateAndBufferSizeDetails (sampleRate, maxBlockSize);
+        newInstance->prepareToPlay (sampleRate, maxBlockSize);
+
+        const int numChans = juce::jmax (2,
+                                         newInstance->getTotalNumInputChannels(),
+                                         newInstance->getTotalNumOutputChannels());
 
         {
             const juce::ScopedLock sl (pluginLock);
@@ -753,7 +912,7 @@ public:
             }
 
             vst3PluginInstance = std::move (newInstance);
-            vst3PluginInstance->prepareToPlay (sampleRate, 2048);
+            vst3Buffer.setSize (numChans, maxBlockSize, false, true, false);
 
             vst3PluginName = vst3PluginInstance->getName();
             auto vendor = vst3PluginInstance->getPluginDescription().manufacturerName;
@@ -782,20 +941,49 @@ public:
         vst3Enabled.store (false);
     }
 
-    bool isVst3PluginLoaded() const
-    {
-        return hasVst3Loaded.load();
-    }
+    bool isVst3PluginLoaded() const { return hasVst3Loaded.load(); }
 
     juce::AudioProcessorEditor* createVst3PluginEditor()
     {
         const juce::ScopedLock sl (pluginLock);
-        if (vst3PluginInstance != nullptr && vst3PluginInstance->hasEditor())
+        if (vst3PluginInstance != nullptr)
         {
-            return vst3PluginInstance->createEditorIfNeeded();
+            if (auto* existing = vst3PluginInstance->getActiveEditor())
+                return existing;
+            if (vst3PluginInstance->hasEditor())
+                return vst3PluginInstance->createEditor();
         }
         return nullptr;
     }
+
+    juce::String getVst3StateBase64()
+    {
+        const juce::ScopedLock sl (pluginLock);
+        if (vst3PluginInstance != nullptr)
+        {
+            juce::MemoryBlock mb;
+            vst3PluginInstance->getStateInformation (mb);
+            if (mb.getSize() > 0)
+                return mb.toBase64Encoding();
+        }
+        return {};
+    }
+
+    void setVst3StateBase64 (const juce::String& base64State)
+    {
+        if (base64State.isEmpty())
+            return;
+
+        const juce::ScopedLock sl (pluginLock);
+        if (vst3PluginInstance != nullptr)
+        {
+            juce::MemoryBlock mb;
+            if (mb.fromBase64Encoding (base64State) && mb.getSize() > 0)
+                vst3PluginInstance->setStateInformation (mb.getData(), static_cast<int> (mb.getSize()));
+        }
+    }
+
+    // ==================== CABINET IR, PEDAL & REVERB IR ====================
 
     bool loadCustomIrFile (const juce::File& irFile)
     {
@@ -804,12 +992,12 @@ public:
 
         try
         {
-            convolution.loadImpulseResponse (irFile,
-                                             juce::dsp::Convolution::Stereo::yes,
-                                             juce::dsp::Convolution::Trim::yes,
-                                             0,
-                                             juce::dsp::Convolution::Normalise::yes);
-            hasCustomIrLoaded = true;
+            cabConvolution.loadImpulseResponse (irFile,
+                                                juce::dsp::Convolution::Stereo::yes,
+                                                juce::dsp::Convolution::Trim::yes,
+                                                0,
+                                                juce::dsp::Convolution::Normalise::yes);
+            hasCustomIrLoaded.store (true);
             customIrName = irFile.getFileName();
             customIrPath = irFile.getFullPathName();
             return true;
@@ -889,12 +1077,12 @@ public:
 
         try
         {
-            convolution.loadImpulseResponse (irFile,
-                                             juce::dsp::Convolution::Stereo::yes,
-                                             juce::dsp::Convolution::Trim::yes,
-                                             0,
-                                             juce::dsp::Convolution::Normalise::yes);
-            hasCustomReverbLoaded = true;
+            reverbConvolution.loadImpulseResponse (irFile,
+                                                   juce::dsp::Convolution::Stereo::yes,
+                                                   juce::dsp::Convolution::Trim::yes,
+                                                   0,
+                                                   juce::dsp::Convolution::Normalise::yes);
+            hasCustomReverbLoaded.store (true);
             customReverbName = irFile.getFileName();
             customReverbPath = irFile.getFullPathName();
             return true;
@@ -903,6 +1091,13 @@ public:
         {
             return false;
         }
+    }
+
+    void unloadCustomReverbIr()
+    {
+        hasCustomReverbLoaded.store (false);
+        customReverbName = "None";
+        customReverbPath = "";
     }
 
     void resetDsp()
@@ -915,10 +1110,6 @@ public:
         preHpState = 0.0f;
         delayDampL = 0.0f;
         delayDampR = 0.0f;
-        revLowpassL = 0.0f;
-        revLowpassR = 0.0f;
-        revTailL = 0.0f;
-        revTailR = 0.0f;
 
         bassFilter.reset();
         midFilter.reset();
@@ -927,13 +1118,14 @@ public:
         cabHpFilter.reset();
         cabLpFilter.reset();
         cabNotchFilter.reset();
+        studioReverb.reset();
     }
 
     // Parameters
     std::atomic<int> inputSource { static_cast<int> (GuitarInputRouting::AutoDetect) };
     std::atomic<int> autoActiveChannel { 2 };
     std::atomic<float> inputTrimDb { 0.0f };
-    std::atomic<bool> masterMute { true };
+    std::atomic<bool> masterMute { false };
     std::atomic<bool> tunerMute { false };
 
     // Noise Gate
@@ -992,11 +1184,12 @@ public:
     // External VST3 Plugin
     std::atomic<bool> vst3Enabled { false };
     std::atomic<bool> hasVst3Loaded { false };
+    std::atomic<int> vst3Position { static_cast<int> (Vst3SlotPosition::PostCab) };
     juce::String vst3PluginName = "No VST3 Plugin Loaded";
     juce::String vst3PluginPath;
 
-    // Output
-    std::atomic<float> outputDb { -50.0f };
+    // Output (sensible default: -6 dB, protected by soft limiter)
+    std::atomic<float> outputDb { -6.0f };
 
     // Telemetry
     std::atomic<float> ch1Rms { 0.0f };
@@ -1005,7 +1198,7 @@ public:
     std::atomic<float> outputRms { 0.0f };
 
     GuitarTuner tuner;
-    bool hasCustomIrLoaded = false;
+    std::atomic<bool> hasCustomIrLoaded { false };
     juce::String customIrName = "None";
     juce::String customIrPath;
 
@@ -1013,11 +1206,41 @@ public:
     juce::String customPedalName = "None";
     juce::String customPedalPath;
 
-    bool hasCustomReverbLoaded = false;
+    std::atomic<bool> hasCustomReverbLoaded { false };
     juce::String customReverbName = "None";
     juce::String customReverbPath;
 
 private:
+    void processVst3Slot (int numSamples)
+    {
+        const juce::ScopedTryLock tryLock (pluginLock);
+        if (! tryLock.isLocked() || vst3PluginInstance == nullptr)
+            return;
+
+        const int totalIn = vst3PluginInstance->getTotalNumInputChannels();
+        const int totalOut = vst3PluginInstance->getTotalNumOutputChannels();
+        const int numChans = juce::jmax (2, totalIn, totalOut);
+
+        if (vst3Buffer.getNumChannels() < numChans || vst3Buffer.getNumSamples() < numSamples)
+            vst3Buffer.setSize (numChans, numSamples, false, false, true);
+
+        vst3Buffer.clear (0, numSamples);
+        if (totalIn >= 1)
+            vst3Buffer.copyFrom (0, 0, tempLeft.data(), numSamples);
+        if (totalIn >= 2)
+            vst3Buffer.copyFrom (1, 0, tempRight.data(), numSamples);
+
+        vst3MidiBuffer.clear();
+        vst3PluginInstance->processBlock (vst3Buffer, vst3MidiBuffer);
+
+        if (totalOut >= 1)
+            juce::FloatVectorOperations::copy (tempLeft.data(), vst3Buffer.getReadPointer (0), numSamples);
+        if (totalOut >= 2)
+            juce::FloatVectorOperations::copy (tempRight.data(), vst3Buffer.getReadPointer (1), numSamples);
+        else if (totalOut == 1)
+            juce::FloatVectorOperations::copy (tempRight.data(), vst3Buffer.getReadPointer (0), numSamples);
+    }
+
     static inline float triodeStage (float x, float drive, float bias)
     {
         float driven = (x + bias) * drive;
@@ -1035,6 +1258,8 @@ private:
     }
 
     double sampleRate = 48000.0;
+    int maxBlockSize = 2048;
+
     std::vector<float> delayBufferL;
     std::vector<float> delayBufferR;
     size_t delayWrite = 0;
@@ -1042,9 +1267,14 @@ private:
     std::vector<float> tempInput;
     std::vector<float> tempLeft;
     std::vector<float> tempRight;
+    std::vector<float> reverbWetL;
+    std::vector<float> reverbWetR;
     float* tempPointers[2] = { nullptr, nullptr };
+    float* reverbPointers[2] = { nullptr, nullptr };
 
-    juce::dsp::Convolution convolution;
+    juce::dsp::Convolution cabConvolution;
+    juce::dsp::Convolution reverbConvolution;
+    juce::dsp::Reverb studioReverb;
     juce::AudioFormatManager irFormatManager;
 
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
@@ -1054,11 +1284,18 @@ private:
     juce::dsp::IIR::Filter<float> midFilter;
     juce::dsp::IIR::Filter<float> trebleFilter;
     juce::dsp::IIR::Filter<float> presenceFilter;
+    double lastToneRate = -1.0;
+    float lastToneBass = -1.0f;
+    float lastToneMid = -1.0f;
+    float lastToneTreble = -1.0f;
+    float lastTonePresence = -1.0f;
 
     // Cabinet Filters
     juce::dsp::IIR::Filter<float> cabHpFilter;
     juce::dsp::IIR::Filter<float> cabLpFilter;
     juce::dsp::IIR::Filter<float> cabNotchFilter;
+    double lastCabRate = -1.0;
+    int lastCabModel = -1;
 
     // NAM Engine
     std::unique_ptr<nam::DSP> namModel;
@@ -1079,8 +1316,4 @@ private:
     float preHpState = 0.0f;
     float delayDampL = 0.0f;
     float delayDampR = 0.0f;
-    float revLowpassL = 0.0f;
-    float revLowpassR = 0.0f;
-    float revTailL = 0.0f;
-    float revTailR = 0.0f;
 };
