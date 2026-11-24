@@ -29,7 +29,9 @@ file(GLOB_RECURSE NAM_SOURCES
     "${neuralampmodelercore_SOURCE_DIR}/NAM/*.c"
 )
 
-add_library(NAMCore STATIC ${NAM_SOURCES})
+# Build NAMCore as an OBJECT library so MSVC links every .obj directly and
+# never strips static ConfigParserRegistry initializers (WaveNet, LSTM, ConvNet, SlimmableContainer, etc.)
+add_library(NAMCore OBJECT ${NAM_SOURCES})
 
 target_include_directories(NAMCore PUBLIC
     "${neuralampmodelercore_SOURCE_DIR}"
