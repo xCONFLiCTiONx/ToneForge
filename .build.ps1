@@ -32,22 +32,27 @@ if ($Clean -and (Test-Path $buildDir)) {
     Remove-Item -Path $buildDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Detect stale Visual Studio generator instance in CMakeCache.txt (e.g., Community -> BuildTools)
-$cacheFile = Join-Path $buildDir "CMakeCache.txt"
-if (Test-Path $cacheFile) {
-    $genInstLine = Select-String -Path $cacheFile -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$' | Select-Object -First 1
-    if ($genInstLine) {
-        $cachedInst = $genInstLine.Matches[0].Groups[1].Value.Trim()
-        if ($cachedInst -and -not (Test-Path $cachedInst)) {
-            Write-Host "Cached Visual Studio instance not found ($cachedInst). Resetting CMake cache..." -ForegroundColor Yellow
-            Remove-Item -Path $cacheFile -Force -ErrorAction SilentlyContinue
-            $cmakeFilesDir = Join-Path $buildDir "CMakeFiles"
-            if (Test-Path $cmakeFilesDir) {
-                Remove-Item -Path $cmakeFilesDir -Recurse -Force -ErrorAction SilentlyContinue
+# Purge every stale CMake cache (main build, FetchContent subbuilds, juceaide) that points at a
+# Visual Studio instance that no longer exists (e.g., Community -> BuildTools).
+if (Test-Path $buildDir) {
+    Get-ChildItem -Path $buildDir -Recurse -Filter CMakeCache.txt -ErrorAction SilentlyContinue | ForEach-Object {
+        $cache = $_.FullName
+        $genInstLine = Select-String -Path $cache -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$' | Select-Object -First 1
+        if ($genInstLine) {
+            $cachedInst = $genInstLine.Matches[0].Groups[1].Value.Trim()
+            if ($cachedInst -and -not (Test-Path $cachedInst)) {
+                Write-Host "Stale Visual Studio instance in $cache ($cachedInst). Resetting..." -ForegroundColor Yellow
+                $dir = Split-Path $cache -Parent
+                Remove-Item -Path $cache -Force -ErrorAction SilentlyContinue
+                $cmakeFilesDir = Join-Path $dir "CMakeFiles"
+                if (Test-Path $cmakeFilesDir) {
+                    Remove-Item -Path $cmakeFilesDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     }
 }
+$cacheFile = Join-Path $buildDir "CMakeCache.txt"
 
 if (-not (Test-Path $cacheFile)) {
     Write-Host "Configuring ToneForge with CMake..." -ForegroundColor Cyan
